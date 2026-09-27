@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use sqlx::PgPool;
 use teloxide::{
     prelude::*,
     types::{
@@ -26,9 +27,13 @@ fn auth_keyboard() -> InlineKeyboardMarkup {
     ]])
 }
 
-// TODO: заменить на проверку по БД. Пока все считаются неавторизованными.
-fn is_authorized(_user_id: UserId) -> bool {
-    false
+async fn is_authorized(pool: &PgPool, user_id: UserId) -> bool {
+    let row: Result<Option<i64>, sqlx::Error> =
+        sqlx::query_scalar("SELECT telegram_id FROM users WHERE telegram_id = $1")
+            .bind(user_id.0 as i64)
+            .fetch_optional(pool)
+            .await;
+    matches!(row, Ok(Some(_)))
 }
 
 #[tokio::main]
@@ -36,6 +41,19 @@ async fn main() {
     dotenvy::dotenv().ok();
     pretty_env_logger::init();
     log::info!("Starting bot...");
+
+    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&db_url)
+        .await
+        .expect("failed to connect to Postgres");
+
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("failed to run migrations");
+    log::info!("Database ready");
 
     // Render Free: нужен HTTP-порт, иначе деплой не пройдет.
     // PORT задает сам Render (дефолт 10000).
@@ -58,7 +76,11 @@ async fn main() {
         )
         .branch(Update::filter_callback_query().endpoint(on_callback));
 
-    Dispatcher::builder(bot, handler).build().dispatch().await;
+    Dispatcher::builder(bot, handler)
+        .dependencies(dptree::deps![pool])
+        .build()
+        .dispatch()
+        .await;
 }
 
 async fn run_health_server(port: u16) {
@@ -74,14 +96,13 @@ async fn run_health_server(port: u16) {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn answer(bot: Bot, msg: Message, cmd: Command) -> ResponseResult<()> {
+async fn answer(bot: Bot, msg: Message, cmd: Command, pool: PgPool) -> ResponseResult<()> {
     match cmd {
         Command::Start => {
-            let authorized = msg
-                .from
-                .as_ref()
-                .map(|u| is_authorized(u.id))
-                .unwrap_or(false);
+            let authorized = match msg.from.as_ref() {
+                Some(user) => is_authorized(&pool, user.id).await,
+                None => false,
+            };
             if authorized {
                 bot.send_message(msg.chat.id, "Вы уже вошли ✅").await?;
             } else {
