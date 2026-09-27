@@ -5,8 +5,8 @@ use std::{
 };
 
 use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit, Nonce, OsRng},
-    Aes256Gcm,
+    aead::{Aead, AeadCore, KeyInit, OsRng},
+    Aes256Gcm, Nonce,
 };
 use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
@@ -613,7 +613,7 @@ fn cabinet_sub(plan: &str, expires_at: Option<DateTime<Utc>>) -> String {
 
 /// Рисует баннер кабинета: слева `> логин`, справа круглая аватарка.
 fn render_profile_image(login: &str) -> Result<Vec<u8>, String> {
-    use image::{imageops::FilterType, GenericImageView, Rgb};
+    use image::{imageops::FilterType, Rgb};
 
     let bg = image::open(PROFILE_BG_PATH)
         .map_err(|e| format!("no background: {e}"))?
