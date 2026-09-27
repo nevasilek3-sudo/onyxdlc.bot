@@ -48,11 +48,13 @@ async fn main() {
 
     let bot = Bot::from_env();
 
-    let handler = Update::filter_message()
+    let handler = dptree::entry()
         .branch(
-            dptree::entry()
-                .filter_command::<Command>()
-                .endpoint(answer),
+            Update::filter_message().branch(
+                dptree::entry()
+                    .filter_command::<Command>()
+                    .endpoint(answer),
+            ),
         )
         .branch(Update::filter_callback_query().endpoint(on_callback));
 
