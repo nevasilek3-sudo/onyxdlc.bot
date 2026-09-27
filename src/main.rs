@@ -99,6 +99,7 @@ async fn send_welcome(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
             .await?;
     } else {
         // Фото не положили в assets/ — шлём тот же текст с кнопками.
+        log::warn!("{WELCOME_PHOTO_PATH} not found, sending text without photo");
         bot.send_message(chat_id, WELCOME_TEXT)
             .reply_markup(keyboard)
             .await?;
