@@ -9,5 +9,7 @@ services:
         sync: false
       - key: DATABASE_URL
         sync: false
+      - key: ENCRYPTION_KEY
+        sync: false
       - key: RUST_LOG
         value: info

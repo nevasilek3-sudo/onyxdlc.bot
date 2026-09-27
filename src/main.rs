@@ -1,24 +1,57 @@
-use std::path::Path;
+use std::{collections::HashMap, path::Path, sync::Arc};
 
+use aes_gcm::{
+    aead::{Aead, AeadCore, KeyInit, OsRng},
+    Aes256Gcm,
+};
+use argon2::{
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
+use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use teloxide::{
     prelude::*,
-    types::{
-        ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
-        MaybeInaccessibleMessage, UserId,
-    },
-    utils::command::BotCommands,
+    types::{ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, UserId},
 };
 
-#[derive(BotCommands, Clone)]
-#[command(rename_rule = "lowercase", description = "Доступные команды:")]
-enum Command {
-    #[command(description = "старт")]
-    Start,
-}
+// ---------- константы ----------
 
 const WELCOME_TEXT: &str = "Привет! Добро пожаловать. Выберите действие";
 const WELCOME_PHOTO_PATH: &str = "assets/welcome.png";
+const AUTH_PHOTO_PATH: &str = "assets/auth.png";
+
+// ---------- состояние диалогов (в памяти, рестарт его сбрасывает) ----------
+
+type Flows = Arc<tokio::Mutex<HashMap<ChatId, Flow>>>;
+type Cipher = Arc<Aes256Gcm>;
+
+#[derive(Clone)]
+enum Flow {
+    Register {
+        username: Option<String>,
+        password: Option<String>,
+    },
+    Login {
+        ident: Option<String>,
+    },
+}
+
+struct Profile {
+    id: i64,
+    username: String,
+    sub_plan: String,
+    sub_expires_at: Option<DateTime<Utc>>,
+    is_admin: bool,
+}
+
+// У админов отображаемый UID всегда 0.
+fn shown_uid(id: i64, is_admin: bool) -> i64 {
+    if is_admin { 0 } else { id }
+}
+
+// ---------- клавиатуры ----------
 
 fn auth_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new([[
@@ -27,20 +60,26 @@ fn auth_keyboard() -> InlineKeyboardMarkup {
     ]])
 }
 
-async fn is_authorized(pool: &PgPool, user_id: UserId) -> bool {
-    let row: Result<Option<i64>, sqlx::Error> =
-        sqlx::query_scalar("SELECT telegram_id FROM users WHERE telegram_id = $1")
-            .bind(user_id.0 as i64)
-            .fetch_optional(pool)
-            .await;
-    matches!(row, Ok(Some(_)))
+fn cancel_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new([[InlineKeyboardButton::callback("✕ Отмена", "cancel")]])
 }
+
+// ---------- main ----------
 
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
     pretty_env_logger::init();
     log::info!("Starting bot...");
+
+    let key_hex = std::env::var("ENCRYPTION_KEY").expect("ENCRYPTION_KEY must be set");
+    let key_bytes = hex::decode(key_hex.trim()).expect("ENCRYPTION_KEY must be hex");
+    assert!(key_bytes.len() == 32, "ENCRYPTION_KEY must be 32 bytes (64 hex chars)");
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&key_bytes);
+    let cipher: Cipher = Arc::new(
+        Aes256Gcm::new_from_slice(&arr).expect("ENCRYPTION_KEY is invalid"),
+    );
 
     let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let pool = sqlx::postgres::PgPoolOptions::new()
@@ -65,19 +104,14 @@ async fn main() {
     tokio::spawn(run_health_server(port));
 
     let bot = Bot::from_env();
+    let flows: Flows = Arc::new(tokio::Mutex::new(HashMap::new()));
 
     let handler = dptree::entry()
-        .branch(
-            Update::filter_message().branch(
-                dptree::entry()
-                    .filter_command::<Command>()
-                    .endpoint(answer),
-            ),
-        )
+        .branch(Update::filter_message().endpoint(on_message))
         .branch(Update::filter_callback_query().endpoint(on_callback));
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![pool])
+        .dependencies(dptree::deps![pool, flows, cipher])
         .build()
         .dispatch()
         .await;
@@ -96,52 +130,553 @@ async fn run_health_server(port: u16) {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn answer(bot: Bot, msg: Message, cmd: Command, pool: PgPool) -> ResponseResult<()> {
-    match cmd {
-        Command::Start => {
-            let authorized = match msg.from.as_ref() {
-                Some(user) => is_authorized(&pool, user.id).await,
-                None => false,
-            };
-            if authorized {
-                bot.send_message(msg.chat.id, "Вы уже вошли ✅").await?;
-            } else {
-                send_welcome(&bot, msg.chat.id).await?;
-            }
+// ---------- сообщения ----------
+
+fn is_start(text: &str) -> bool {
+    text == "/start" || text.starts_with("/start ") || text.starts_with("/start@")
+}
+
+async fn on_message(
+    bot: Bot,
+    msg: Message,
+    pool: PgPool,
+    flows: Flows,
+    cipher: Cipher,
+) -> ResponseResult<()> {
+    let chat_id = msg.chat.id;
+    let text = msg.text().map(|t| t.trim().to_string()).unwrap_or_default();
+
+    if text == "/cancel" {
+        flows.lock().await.remove(&chat_id);
+        bot.send_message(chat_id, "Отменено. /start — в начало.").await?;
+        return Ok(());
+    }
+
+    if is_start(&text) {
+        flows.lock().await.remove(&chat_id);
+        return cmd_start(&bot, &msg, &pool).await;
+    }
+
+    if text.is_empty() {
+        return Ok(());
+    }
+
+    let flow = flows.lock().await.remove(&chat_id);
+    match flow {
+        None => {
+            bot.send_message(chat_id, "Нажмите /start, чтобы начать.").await?;
+        }
+        Some(Flow::Register { username: None, .. }) => {
+            reg_username(&bot, chat_id, &pool, &flows, &text).await?;
+        }
+        Some(Flow::Register { username: Some(u), password: None }) => {
+            // Пароль из чата стираем сразу.
+            bot.delete_message(chat_id, msg.id).await.ok();
+            reg_password(&bot, chat_id, &flows, u, &text).await?;
+        }
+        Some(Flow::Register { username: Some(u), password: Some(p) }) => {
+            reg_email(&bot, chat_id, &pool, &flows, &cipher, &msg, u, p, &text).await?;
+        }
+        Some(Flow::Login { ident: None }) => {
+            flows.lock().await.insert(
+                chat_id,
+                Flow::Login { ident: Some(text.clone()) },
+            );
+            bot.send_message(chat_id, "Введите пароль:")
+                .reply_markup(cancel_keyboard())
+                .await?;
+        }
+        Some(Flow::Login { ident: Some(ident) }) => {
+            bot.delete_message(chat_id, msg.id).await.ok();
+            login_password(&bot, chat_id, &pool, &flows, ident, &text).await?;
         }
     }
     Ok(())
 }
 
+async fn cmd_start(bot: &Bot, msg: &Message, pool: &PgPool) -> ResponseResult<()> {
+    let tg = msg.from.as_ref().map(|u| u.id.0 as i64);
+    match tg {
+        Some(tg_id) => match profile_by_tg(pool, tg_id).await {
+            Ok(Some(p)) => {
+                bot.send_message(
+                    msg.chat.id,
+                    format!(
+                        "Вы уже вошли как {} ✅\nUID: {}\nПодписка: {}",
+                        p.username,
+                        shown_uid(p.id, p.is_admin),
+                        format_sub(&p.sub_plan, p.sub_expires_at)
+                    ),
+                )
+                .await?;
+            }
+            Ok(None) => send_welcome(bot, msg.chat.id).await?,
+            Err(e) => {
+                log::error!("db error on /start: {e}");
+                bot.send_message(msg.chat.id, "Временная ошибка, попробуйте позже.")
+                    .await?;
+            }
+        },
+        None => send_welcome(bot, msg.chat.id).await?,
+    }
+    Ok(())
+}
+
+// ---------- колбэки ----------
+
+async fn on_callback(bot: Bot, q: CallbackQuery, pool: PgPool, flows: Flows) -> ResponseResult<()> {
+    // Убираем «часики» на кнопке.
+    bot.answer_callback_query(q.id.clone()).await?;
+    let chat_id = match &q.message {
+        Some(m) => m.chat().id,
+        None => ChatId(q.from.id.0 as i64),
+    };
+    let tg_id = q.from.id.0 as i64;
+
+    match q.data.as_deref() {
+        Some("cancel") => {
+            flows.lock().await.remove(&chat_id);
+            bot.send_message(chat_id, "Отменено. /start — в начало.").await?;
+        }
+        Some("login") => {
+            flows.lock().await.remove(&chat_id);
+            send_auth_photo(
+                &bot,
+                chat_id,
+                "Авторизация\n\nВведите ваш логин или почту.",
+            )
+            .await?;
+            flows.lock().await.insert(chat_id, Flow::Login { ident: None });
+        }
+        Some("register") => {
+            match telegram_has_account(&pool, tg_id).await {
+                Ok(true) => {
+                    bot.send_message(
+                        chat_id,
+                        "У вас уже есть аккаунт. Нажмите «Войти».",
+                    )
+                    .reply_markup(auth_keyboard())
+                    .await?;
+                }
+                _ => {
+                    flows.lock().await.remove(&chat_id);
+                    send_auth_photo(
+                        &bot,
+                        chat_id,
+                        "Регистрация\n\nШаг 1/3: придумайте логин — 3–32 символа (латиница, цифры, _).",
+                    )
+                    .await?;
+                    flows.lock().await.insert(
+                        chat_id,
+                        Flow::Register { username: None, password: None },
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+// ---------- регистрация ----------
+
+async fn reg_username(
+    bot: &Bot,
+    chat_id: ChatId,
+    pool: &PgPool,
+    flows: &Flows,
+    text: &str,
+) -> ResponseResult<()> {
+    if let Err(e) = validate_username(text) {
+        flows.lock().await.insert(
+            chat_id,
+            Flow::Register { username: None, password: None },
+        );
+        bot.send_message(chat_id, format!("{e}\n\nПопробуйте другой логин:"))
+            .reply_markup(cancel_keyboard())
+            .await?;
+        return Ok(());
+    }
+    match username_taken(pool, text).await {
+        Ok(true) => {
+            flows.lock().await.insert(
+                chat_id,
+                Flow::Register { username: None, password: None },
+            );
+            bot.send_message(chat_id, "Такой логин уже занят. Введите другой:")
+                .reply_markup(cancel_keyboard())
+                .await?;
+        }
+        Err(e) => {
+            log::error!("db error: {e}");
+            bot.send_message(chat_id, "Временная ошибка, попробуйте позже.").await?;
+        }
+        Ok(false) => {
+            flows.lock().await.insert(
+                chat_id,
+                Flow::Register { username: Some(text.to_string()), password: None },
+            );
+            bot.send_message(chat_id, "Шаг 2/3: придумайте пароль (минимум 8 символов).\n\nСообщение с паролем я сразу удалю из чата.")
+                .reply_markup(cancel_keyboard())
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn reg_password(
+    bot: &Bot,
+    chat_id: ChatId,
+    flows: &Flows,
+    username: String,
+    text: &str,
+) -> ResponseResult<()> {
+    if text.chars().count() < 8 {
+        flows.lock().await.insert(
+            chat_id,
+            Flow::Register { username: Some(username), password: None },
+        );
+        bot.send_message(chat_id, "Пароль слишком короткий (нужно минимум 8 символов). Введите другой:")
+            .reply_markup(cancel_keyboard())
+            .await?;
+        return Ok(());
+    }
+    flows.lock().await.insert(
+        chat_id,
+        Flow::Register { username: Some(username), password: Some(text.to_string()) },
+    );
+    bot.send_message(chat_id, "Шаг 3/3: введите вашу почту.")
+        .reply_markup(cancel_keyboard())
+        .await?;
+    Ok(())
+}
+
+async fn reg_email(
+    bot: &Bot,
+    chat_id: ChatId,
+    pool: &PgPool,
+    flows: &Flows,
+    cipher: &Cipher,
+    msg: &Message,
+    username: String,
+    password: String,
+    text: &str,
+) -> ResponseResult<()> {
+    let email = text.trim().to_lowercase();
+    if let Err(e) = validate_email(&email) {
+        flows.lock().await.insert(
+            chat_id,
+            Flow::Register { username: Some(username), password: Some(password) },
+        );
+        bot.send_message(chat_id, format!("{e}\n\nВведите почту еще раз:"))
+            .reply_markup(cancel_keyboard())
+            .await?;
+        return Ok(());
+    }
+    let email_hash = sha_hex(&email);
+    match email_taken(pool, &email_hash).await {
+        Ok(true) => {
+            flows.lock().await.insert(
+                chat_id,
+                Flow::Register { username: Some(username), password: Some(password) },
+            );
+            bot.send_message(chat_id, "Эта почта уже используется. Введите другую:")
+                .reply_markup(cancel_keyboard())
+                .await?;
+            return Ok(());
+        }
+        Err(e) => {
+            log::error!("db error: {e}");
+            bot.send_message(chat_id, "Временная ошибка, попробуйте позже.").await?;
+            return Ok(());
+        }
+        Ok(false) => {}
+    }
+
+    // Хеш пароля считаем вне async, чтобы не стопать рантайм.
+    let pw = password.clone();
+    let pw_hash = match tokio::task::spawn_blocking(move || hash_password(&pw)).await {
+        Ok(Ok(h)) => h,
+        _ => {
+            log::error!("password hashing failed");
+            bot.send_message(chat_id, "Временная ошибка, попробуйте позже.").await?;
+            return Ok(());
+        }
+    };
+    let email_enc = encrypt(cipher, &email);
+    let tg_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
+
+    let row: Result<Option<(i64,)>, sqlx::Error> = sqlx::query_as(
+        "INSERT INTO users (telegram_id, username, password_hash, email_hash, email_enc)
+         VALUES ($1, $2, $3, $4, $5) RETURNING id",
+    )
+    .bind(tg_id)
+    .bind(&username)
+    .bind(&pw_hash)
+    .bind(&email_hash)
+    .bind(&email_enc)
+    .fetch_optional(pool)
+    .await;
+
+    match row {
+        Ok(Some((id,))) => {
+            bot.send_message(
+                chat_id,
+                format!("Готово! Аккаунт создан ✅\nВаш UID: {id}\nПодписка: нет\n\n/start — продолжить."),
+            )
+            .await?;
+        }
+        _ => {
+            // Скорее всего гонка: такой логин/почта/телеграм уже заняты.
+            flows.lock().await.remove(&chat_id);
+            bot.send_message(
+                chat_id,
+                "Не получилось создать аккаунт (возможно, логин или почта уже заняты). Нажмите /start и попробуйте снова.",
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+// ---------- вход ----------
+
+async fn login_password(
+    bot: &Bot,
+    chat_id: ChatId,
+    pool: &PgPool,
+    flows: &Flows,
+    ident: String,
+    password: &str,
+) -> ResponseResult<()> {
+    let email_hash = sha_hex(&ident.trim().to_lowercase());
+    let row: Result<Option<(i64, String, String, String, bool, Option<DateTime<Utc>>)>, sqlx::Error> =
+        sqlx::query_as(
+            "SELECT id, username, password_hash, sub_plan, is_admin, sub_expires_at FROM users
+             WHERE username = $1 OR email_hash = $2",
+        )
+        .bind(&ident)
+        .bind(&email_hash)
+        .fetch_optional(pool)
+        .await;
+
+    let (id, username, pw_hash, sub_plan, is_admin, sub_exp) = match row {
+        Ok(Some(r)) => r,
+        _ => {
+            flows.lock().await.remove(&chat_id);
+            // Специально общая ошибка: не палим, существует ли логин.
+            bot.send_message(chat_id, "Неверный логин или пароль.").await?;
+            return Ok(());
+        }
+    };
+
+    let pw = password.to_string();
+    let h = pw_hash.clone();
+    let ok = tokio::task::spawn_blocking(move || verify_password(&h, &pw))
+        .await
+        .unwrap_or(false);
+    if !ok {
+        flows.lock().await.remove(&chat_id);
+        bot.send_message(chat_id, "Неверный логин или пароль.").await?;
+        return Ok(());
+    }
+
+    // Привязываем этот Telegram к аккаунту.
+    let tg_id = chat_id.0;
+    if let Err(e) = sqlx::query("UPDATE users SET telegram_id = $1 WHERE id = $2")
+        .bind(tg_id)
+        .bind(id)
+        .execute(pool)
+        .await
+    {
+        log::error!("bind telegram failed: {e}");
+        flows.lock().await.remove(&chat_id);
+        bot.send_message(
+            chat_id,
+            "Этот Telegram уже привязан к другому аккаунту.",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    flows.lock().await.remove(&chat_id);
+    bot.send_message(
+        chat_id,
+        format!(
+            "Вход выполнен ✅\nUID: {}\nЛогин: {username}\nПодписка: {}",
+            shown_uid(id, is_admin),
+            format_sub(&sub_plan, sub_exp)
+        ),
+    )
+    .await?;
+    Ok(())
+}
+
+// ---------- фото и тексты ----------
+
 async fn send_welcome(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
-    let keyboard = auth_keyboard();
     if Path::new(WELCOME_PHOTO_PATH).exists() {
         bot.send_photo(chat_id, InputFile::file(WELCOME_PHOTO_PATH))
             .caption(WELCOME_TEXT)
-            .reply_markup(keyboard)
+            .reply_markup(auth_keyboard())
             .await?;
     } else {
-        // Фото не положили в assets/ — шлём тот же текст с кнопками.
         log::warn!("{WELCOME_PHOTO_PATH} not found, sending text without photo");
         bot.send_message(chat_id, WELCOME_TEXT)
-            .reply_markup(keyboard)
+            .reply_markup(auth_keyboard())
             .await?;
     }
     Ok(())
 }
 
-async fn on_callback(bot: Bot, q: CallbackQuery) -> ResponseResult<()> {
-    let text = match q.data.as_deref() {
-        Some("login") => "Раздел «Войти» скоро появится.",
-        Some("register") => "Раздел «Регистрация» скоро появится.",
-        _ => return Ok(()),
+async fn send_auth_photo(bot: &Bot, chat_id: ChatId, caption: &str) -> ResponseResult<()> {
+    if Path::new(AUTH_PHOTO_PATH).exists() {
+        bot.send_photo(chat_id, InputFile::file(AUTH_PHOTO_PATH))
+            .caption(caption)
+            .reply_markup(cancel_keyboard())
+            .await?;
+    } else {
+        log::warn!("{AUTH_PHOTO_PATH} not found, sending text without photo");
+        bot.send_message(chat_id, caption)
+            .reply_markup(cancel_keyboard())
+            .await?;
+    }
+    Ok(())
+}
+
+fn format_sub(plan: &str, expires_at: Option<DateTime<Utc>>) -> String {
+    match plan {
+        "forever" => "навсегда".to_string(),
+        "d30" | "d120" | "d240" | "d360" => {
+            let days_total = match plan {
+                "d30" => 30,
+                "d120" => 120,
+                "d240" => 240,
+                _ => 360,
+            };
+            match expires_at {
+                Some(exp) => {
+                    let left = (exp - Utc::now()).num_days().max(0);
+                    if left <= 0 {
+                        "истекла".to_string()
+                    } else {
+                        format!("{days_total} дней (осталось {left} дн.)")
+                    }
+                }
+                None => format!("{days_total} дней"),
+            }
+        }
+        _ => "нет".to_string(),
+    }
+}
+
+// ---------- работа с БД ----------
+
+async fn profile_by_tg(pool: &PgPool, tg_id: i64) -> Result<Option<Profile>, sqlx::Error> {
+    let row: Option<(i64, String, String, bool, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT id, username, sub_plan, is_admin, sub_expires_at FROM users WHERE telegram_id = $1",
+    )
+    .bind(tg_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(id, username, sub_plan, is_admin, sub_expires_at)| Profile {
+        id,
+        username,
+        sub_plan,
+        sub_expires_at,
+        is_admin,
+    }))
+}
+
+async fn telegram_has_account(pool: &PgPool, tg_id: i64) -> Result<bool, sqlx::Error> {
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT telegram_id FROM users WHERE telegram_id = $1")
+            .bind(tg_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.is_some())
+}
+
+async fn username_taken(pool: &PgPool, username: &str) -> Result<bool, sqlx::Error> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT username FROM users WHERE username = $1")
+        .bind(username)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some())
+}
+
+async fn email_taken(pool: &PgPool, email_hash: &str) -> Result<bool, sqlx::Error> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT email_hash FROM users WHERE email_hash = $1")
+            .bind(email_hash)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.is_some())
+}
+
+// ---------- криптография ----------
+
+fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
+    let salt = SaltString::generate(&mut OsRng);
+    Ok(Argon2::default()
+        .hash_password(password.as_bytes(), &salt)?
+        .to_string())
+}
+
+fn verify_password(hash: &str, password: &str) -> bool {
+    let parsed = match PasswordHash::new(hash) {
+        Ok(h) => h,
+        Err(_) => return false,
     };
-    // Убираем «часики» на кнопке.
-    bot.answer_callback_query(q.id.clone()).await?;
-    let chat_id = match q.message {
-        Some(MaybeInaccessibleMessage::Regular(msg)) => msg.chat.id,
-        _ => ChatId(q.from.id.0 as i64),
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
+}
+
+fn encrypt(cipher: &Aes256Gcm, plain: &str) -> String {
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let ct = cipher
+        .encrypt(&nonce, plain.as_bytes())
+        .expect("encryption failed");
+    let mut v = nonce.to_vec();
+    v.extend_from_slice(&ct);
+    hex::encode(v)
+}
+
+fn sha_hex(s: &str) -> String {
+    hex::encode(Sha256::digest(s.as_bytes()))
+}
+
+// ---------- валидация ----------
+
+fn validate_username(s: &str) -> Result<(), &'static str> {
+    let len = s.chars().count();
+    if !(3..=32).contains(&len) {
+        return Err("Логин должен быть 3–32 символа.");
+    }
+    if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err("Логин: только латиница, цифры и _.");
+    }
+    Ok(())
+}
+
+fn validate_email(s: &str) -> Result<(), &'static str> {
+    if s.len() > 254 || s.contains(' ') {
+        return Err("Некорректная почта.");
+    }
+    let mut parts = s.split('@');
+    let (local, domain) = match (parts.next(), parts.next(), parts.next()) {
+        (Some(l), Some(d), None) => (l, d),
+        _ => return Err("Некорректная почта."),
     };
-    bot.send_message(chat_id, text).await?;
+    if local.is_empty() || domain.is_empty() || !domain.contains('.') {
+        return Err("Некорректная почта.");
+    }
+    let ok = |p: &str| {
+        !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || "-._+%".contains(c))
+    };
+    if !ok(local) || !domain.split('.').all(ok) {
+        return Err("Некорректная почта.");
+    }
     Ok(())
 }
