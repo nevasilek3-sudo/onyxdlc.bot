@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use teloxide::{
     prelude::*,
-    types::{ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, UserId},
+    types::{ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile},
 };
 
 // ---------- константы ----------
