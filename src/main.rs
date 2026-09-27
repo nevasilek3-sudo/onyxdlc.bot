@@ -115,7 +115,7 @@ async fn on_callback(bot: Bot, q: CallbackQuery) -> ResponseResult<()> {
     // Убираем «часики» на кнопке.
     bot.answer_callback_query(q.id.clone()).await?;
     let chat_id = match q.message {
-        Some(MaybeInaccessibleMessage::Regular(msg, _)) => msg.chat.id,
+        Some(MaybeInaccessibleMessage::Regular(msg)) => msg.chat.id,
         _ => ChatId(q.from.id.0 as i64),
     };
     bot.send_message(chat_id, text).await?;
