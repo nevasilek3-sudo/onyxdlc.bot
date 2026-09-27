@@ -82,10 +82,10 @@ fn cancel_keyboard() -> InlineKeyboardMarkup {
 }
 
 fn cabinet_keyboard() -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup::new([[
-        InlineKeyboardButton::callback("Купить подписку 💳", "buy"),
-        InlineKeyboardButton::callback("Активировать ключ 🔑", "key"),
-    ]])
+    InlineKeyboardMarkup::new([
+        [InlineKeyboardButton::callback("Купить подписку 💳", "buy")],
+        [InlineKeyboardButton::callback("Активировать ключ 🔑", "key")],
+    ])
 }
 
 // ---------- main ----------
@@ -575,20 +575,7 @@ async fn send_cabinet(
     p: &Profile,
     hwid: Option<String>,
 ) -> ResponseResult<()> {
-    // 1. Фото с логином и аватаркой.
-    match render_profile_image(&p.username) {
-        Ok(png) => {
-            let path = std::env::temp_dir().join(format!("profile_{}.png", p.telegram_id));
-            if tokio::fs::write(&path, &png).await.is_ok() {
-                bot.send_photo(chat_id, InputFile::file(&path)).await.ok();
-            } else {
-                log::warn!("cannot write profile image to temp dir");
-            }
-        }
-        Err(e) => log::warn!("profile image skipped: {e}"),
-    }
-
-    // 2. Текст профиля + кнопки.
+    // Фото + текст + кнопки — одним сообщением.
     let text = format!(
         "┌ Профиль ☁️\n├ Логин: {}\n├ Роль: {}\n├ Подписка: {}\n├ UID: {}\n├ ID: {}\n└ HWID: {}",
         p.username,
@@ -598,6 +585,27 @@ async fn send_cabinet(
         p.telegram_id,
         hwid.unwrap_or_else(|| "Не привязан".to_string()),
     );
+    let kb = cabinet_keyboard();
+    match render_profile_image(&p.username) {
+        Ok(png) => {
+            let path = std::env::temp_dir().join(format!("profile_{}.png", p.telegram_id));
+            if tokio::fs::write(&path, &png).await.is_ok() {
+                if bot
+                    .send_photo(chat_id, InputFile::file(&path))
+                    .caption(&text)
+                    .reply_markup(kb)
+                    .await
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+            } else {
+                log::warn!("cannot write profile image to temp dir");
+            }
+        }
+        Err(e) => log::warn!("profile image skipped: {e}"),
+    }
+    // Запасной вариант без фото.
     bot.send_message(chat_id, text)
         .reply_markup(cabinet_keyboard())
         .await?;
@@ -611,7 +619,8 @@ fn cabinet_sub(plan: &str, expires_at: Option<DateTime<Utc>>) -> String {
     format_sub(plan, expires_at)
 }
 
-/// Рисует баннер кабинета: слева `> логин`, справа круглая аватарка.
+/// Рисует баннер кабинета: ник крупно по центру слева, справа большая
+/// круглая аватарка с одинаковыми отступами сверху/справа/снизу.
 fn render_profile_image(login: &str) -> Result<Vec<u8>, String> {
     use image::{imageops::FilterType, Rgb};
 
@@ -623,35 +632,21 @@ fn render_profile_image(login: &str) -> Result<Vec<u8>, String> {
         return Err("background too small".to_string());
     }
     let mut img = bg;
+    let wf = w as f32;
+    let hf = h as f32;
 
-    // Текст слева, как на баннере «Добро пожаловать».
-    let font =
-        ab_glyph::FontRef::try_from_slice(FONT_BYTES).map_err(|e| format!("no font: {e}"))?;
-    let mut scale = h as f32 * 0.11;
-    if login.chars().count() > 18 {
-        scale *= 18.0 / login.chars().count() as f32;
-    }
-    imageproc::drawing::draw_text_mut(
-        &mut img,
-        Rgb([255u8, 255u8, 255u8]),
-        (w as f32 * 0.085) as i32,
-        (h as f32 * 0.31) as i32,
-        scale,
-        &font,
-        &format!("> {login}"),
-    );
-
-    // Круглая аватарка справа.
+    // Аватарка справа: равные отступы сверху/справа/снизу.
+    let m = hf * 0.09;
+    let d = (hf - 2.0 * m) as u32;
     let av = image::open(AVATAR_DEFAULT_PATH)
         .map_err(|e| format!("no avatar: {e}"))?
         .to_rgb8();
-    let d = (h as f32 * 0.34) as u32;
     let av = image::imageops::resize(&av, d, d, FilterType::Lanczos3);
-    let cx = (w as f32 * 0.835) as i32;
-    let cy = (h as f32 * 0.41) as i32;
+    let cx = wf - m - d as f32 / 2.0;
+    let cy = hf / 2.0;
     let r = d as f32 / 2.0;
-    let x0 = cx - d as i32 / 2;
-    let y0 = cy - d as i32 / 2;
+    let x0 = (cx - r) as i32;
+    let y0 = (cy - r) as i32;
     for y in 0..d {
         for x in 0..d {
             let dx = x as f32 - r;
@@ -664,16 +659,31 @@ fn render_profile_image(login: &str) -> Result<Vec<u8>, String> {
             }
         }
     }
-    // Белый ободок, как у иконки на баннере.
-    let ring = ((d / 45).max(2)) as i32;
-    for i in 0..ring {
-        imageproc::drawing::draw_hollow_circle_mut(
-            &mut img,
-            (cx, cy),
-            r as i32 - i,
-            Rgb([255u8, 255u8, 255u8]),
-        );
+
+    // Ник слева: крупный, по центру свободной зоны.
+    let font =
+        ab_glyph::FontRef::try_from_slice(FONT_BYTES).map_err(|e| format!("no font: {e}"))?;
+    let gap = wf * 0.04;
+    let area_w = (cx - r) - gap;
+    let mut scale = hf * 0.16;
+    let (tw, _) =
+        imageproc::drawing::text_size(ab_glyph::PxScale::from(scale), &font, login);
+    if tw > 0 && tw as f32 > area_w * 0.94 {
+        scale *= area_w * 0.94 / tw as f32;
     }
+    let (tw, _) =
+        imageproc::drawing::text_size(ab_glyph::PxScale::from(scale), &font, login);
+    let tx = ((area_w - tw as f32) / 2.0).max(0.0) as i32;
+    let ty = ((hf - scale) / 2.0) as i32;
+    imageproc::drawing::draw_text_mut(
+        &mut img,
+        Rgb([255u8, 255u8, 255u8]),
+        tx,
+        ty,
+        scale,
+        &font,
+        login,
+    );
 
     let mut buf = Vec::new();
     img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
