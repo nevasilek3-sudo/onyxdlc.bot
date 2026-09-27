@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
@@ -24,7 +28,7 @@ const AUTH_PHOTO_PATH: &str = "assets/auth.png";
 
 // ---------- состояние диалогов (в памяти, рестарт его сбрасывает) ----------
 
-type Flows = Arc<tokio::Mutex<HashMap<ChatId, Flow>>>;
+type Flows = Arc<Mutex<HashMap<ChatId, Flow>>>;
 type Cipher = Arc<Aes256Gcm>;
 
 #[derive(Clone)]
@@ -104,7 +108,7 @@ async fn main() {
     tokio::spawn(run_health_server(port));
 
     let bot = Bot::from_env();
-    let flows: Flows = Arc::new(tokio::Mutex::new(HashMap::new()));
+    let flows: Flows = Arc::new(Mutex::new(HashMap::new()));
 
     let handler = dptree::entry()
         .branch(Update::filter_message().endpoint(on_message))
@@ -147,13 +151,13 @@ async fn on_message(
     let text = msg.text().map(|t| t.trim().to_string()).unwrap_or_default();
 
     if text == "/cancel" {
-        flows.lock().await.remove(&chat_id);
+        flows.lock().unwrap().remove(&chat_id);
         bot.send_message(chat_id, "Отменено. /start — в начало.").await?;
         return Ok(());
     }
 
     if is_start(&text) {
-        flows.lock().await.remove(&chat_id);
+        flows.lock().unwrap().remove(&chat_id);
         return cmd_start(&bot, &msg, &pool).await;
     }
 
@@ -161,7 +165,7 @@ async fn on_message(
         return Ok(());
     }
 
-    let flow = flows.lock().await.remove(&chat_id);
+    let flow = flows.lock().unwrap().remove(&chat_id);
     match flow {
         None => {
             bot.send_message(chat_id, "Нажмите /start, чтобы начать.").await?;
@@ -178,7 +182,7 @@ async fn on_message(
             reg_email(&bot, chat_id, &pool, &flows, &cipher, &msg, u, p, &text).await?;
         }
         Some(Flow::Login { ident: None }) => {
-            flows.lock().await.insert(
+            flows.lock().unwrap().insert(
                 chat_id,
                 Flow::Login { ident: Some(text.clone()) },
             );
@@ -235,18 +239,18 @@ async fn on_callback(bot: Bot, q: CallbackQuery, pool: PgPool, flows: Flows) -> 
 
     match q.data.as_deref() {
         Some("cancel") => {
-            flows.lock().await.remove(&chat_id);
+            flows.lock().unwrap().remove(&chat_id);
             bot.send_message(chat_id, "Отменено. /start — в начало.").await?;
         }
         Some("login") => {
-            flows.lock().await.remove(&chat_id);
+            flows.lock().unwrap().remove(&chat_id);
             send_auth_photo(
                 &bot,
                 chat_id,
                 "Авторизация\n\nВведите ваш логин или почту.",
             )
             .await?;
-            flows.lock().await.insert(chat_id, Flow::Login { ident: None });
+            flows.lock().unwrap().insert(chat_id, Flow::Login { ident: None });
         }
         Some("register") => {
             match telegram_has_account(&pool, tg_id).await {
@@ -259,14 +263,14 @@ async fn on_callback(bot: Bot, q: CallbackQuery, pool: PgPool, flows: Flows) -> 
                     .await?;
                 }
                 _ => {
-                    flows.lock().await.remove(&chat_id);
+                    flows.lock().unwrap().remove(&chat_id);
                     send_auth_photo(
                         &bot,
                         chat_id,
                         "Регистрация\n\nШаг 1/3: придумайте логин — 3–32 символа (латиница, цифры, _).",
                     )
                     .await?;
-                    flows.lock().await.insert(
+                    flows.lock().unwrap().insert(
                         chat_id,
                         Flow::Register { username: None, password: None },
                     );
@@ -288,7 +292,7 @@ async fn reg_username(
     text: &str,
 ) -> ResponseResult<()> {
     if let Err(e) = validate_username(text) {
-        flows.lock().await.insert(
+        flows.lock().unwrap().insert(
             chat_id,
             Flow::Register { username: None, password: None },
         );
@@ -299,7 +303,7 @@ async fn reg_username(
     }
     match username_taken(pool, text).await {
         Ok(true) => {
-            flows.lock().await.insert(
+            flows.lock().unwrap().insert(
                 chat_id,
                 Flow::Register { username: None, password: None },
             );
@@ -312,7 +316,7 @@ async fn reg_username(
             bot.send_message(chat_id, "Временная ошибка, попробуйте позже.").await?;
         }
         Ok(false) => {
-            flows.lock().await.insert(
+            flows.lock().unwrap().insert(
                 chat_id,
                 Flow::Register { username: Some(text.to_string()), password: None },
             );
@@ -332,7 +336,7 @@ async fn reg_password(
     text: &str,
 ) -> ResponseResult<()> {
     if text.chars().count() < 8 {
-        flows.lock().await.insert(
+        flows.lock().unwrap().insert(
             chat_id,
             Flow::Register { username: Some(username), password: None },
         );
@@ -341,7 +345,7 @@ async fn reg_password(
             .await?;
         return Ok(());
     }
-    flows.lock().await.insert(
+    flows.lock().unwrap().insert(
         chat_id,
         Flow::Register { username: Some(username), password: Some(text.to_string()) },
     );
@@ -364,7 +368,7 @@ async fn reg_email(
 ) -> ResponseResult<()> {
     let email = text.trim().to_lowercase();
     if let Err(e) = validate_email(&email) {
-        flows.lock().await.insert(
+        flows.lock().unwrap().insert(
             chat_id,
             Flow::Register { username: Some(username), password: Some(password) },
         );
@@ -376,7 +380,7 @@ async fn reg_email(
     let email_hash = sha_hex(&email);
     match email_taken(pool, &email_hash).await {
         Ok(true) => {
-            flows.lock().await.insert(
+            flows.lock().unwrap().insert(
                 chat_id,
                 Flow::Register { username: Some(username), password: Some(password) },
             );
@@ -428,7 +432,7 @@ async fn reg_email(
         }
         _ => {
             // Скорее всего гонка: такой логин/почта/телеграм уже заняты.
-            flows.lock().await.remove(&chat_id);
+            flows.lock().unwrap().remove(&chat_id);
             bot.send_message(
                 chat_id,
                 "Не получилось создать аккаунт (возможно, логин или почта уже заняты). Нажмите /start и попробуйте снова.",
@@ -463,7 +467,7 @@ async fn login_password(
     let (id, username, pw_hash, sub_plan, is_admin, sub_exp) = match row {
         Ok(Some(r)) => r,
         _ => {
-            flows.lock().await.remove(&chat_id);
+            flows.lock().unwrap().remove(&chat_id);
             // Специально общая ошибка: не палим, существует ли логин.
             bot.send_message(chat_id, "Неверный логин или пароль.").await?;
             return Ok(());
@@ -476,7 +480,7 @@ async fn login_password(
         .await
         .unwrap_or(false);
     if !ok {
-        flows.lock().await.remove(&chat_id);
+        flows.lock().unwrap().remove(&chat_id);
         bot.send_message(chat_id, "Неверный логин или пароль.").await?;
         return Ok(());
     }
@@ -490,7 +494,7 @@ async fn login_password(
         .await
     {
         log::error!("bind telegram failed: {e}");
-        flows.lock().await.remove(&chat_id);
+        flows.lock().unwrap().remove(&chat_id);
         bot.send_message(
             chat_id,
             "Этот Telegram уже привязан к другому аккаунту.",
@@ -499,7 +503,7 @@ async fn login_password(
         return Ok(());
     }
 
-    flows.lock().await.remove(&chat_id);
+    flows.lock().unwrap().remove(&chat_id);
     bot.send_message(
         chat_id,
         format!(
