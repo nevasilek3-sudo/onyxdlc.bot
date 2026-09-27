@@ -5,7 +5,7 @@ use std::{
 };
 
 use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit, OsRng},
+    aead::{Aead, AeadCore, KeyInit, Nonce, OsRng},
     Aes256Gcm,
 };
 use argon2::{
@@ -25,6 +25,9 @@ use teloxide::{
 const WELCOME_TEXT: &str = "Привет! Добро пожаловать. Выберите действие";
 const WELCOME_PHOTO_PATH: &str = "assets/welcome.png";
 const AUTH_PHOTO_PATH: &str = "assets/auth.png";
+const PROFILE_BG_PATH: &str = "assets/background.png";
+const AVATAR_DEFAULT_PATH: &str = "assets/mandarin.jpg";
+const FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/DejaVuSans-Bold.ttf");
 
 // ---------- состояние диалогов (в памяти, рестарт его сбрасывает) ----------
 
@@ -44,15 +47,25 @@ enum Flow {
 
 struct Profile {
     id: i64,
+    telegram_id: i64,
     username: String,
     sub_plan: String,
     sub_expires_at: Option<DateTime<Utc>>,
-    is_admin: bool,
+    role: String,
+    hwid_enc: Option<String>,
 }
 
 // У админов отображаемый UID всегда 0.
-fn shown_uid(id: i64, is_admin: bool) -> i64 {
-    if is_admin { 0 } else { id }
+fn shown_uid(id: i64, role: &str) -> i64 {
+    if role == "admin" { 0 } else { id }
+}
+
+fn role_display(role: &str) -> &'static str {
+    match role {
+        "admin" => "Администратор",
+        "media" => "Медиа",
+        _ => "Пользователь",
+    }
 }
 
 // ---------- клавиатуры ----------
@@ -66,6 +79,13 @@ fn auth_keyboard() -> InlineKeyboardMarkup {
 
 fn cancel_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new([[InlineKeyboardButton::callback("✕ Отмена", "cancel")]])
+}
+
+fn cabinet_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new([[
+        InlineKeyboardButton::callback("Купить подписку 💳", "buy"),
+        InlineKeyboardButton::callback("Активировать ключ 🔑", "key"),
+    ]])
 }
 
 // ---------- main ----------
@@ -158,7 +178,7 @@ async fn on_message(
 
     if is_start(&text) {
         flows.lock().unwrap().remove(&chat_id);
-        return cmd_start(&bot, &msg, &pool).await;
+        return cmd_start(&bot, &msg, &pool, &cipher).await;
     }
 
     if text.is_empty() {
@@ -192,27 +212,24 @@ async fn on_message(
         }
         Some(Flow::Login { ident: Some(ident) }) => {
             bot.delete_message(chat_id, msg.id).await.ok();
-            login_password(&bot, chat_id, &pool, &flows, ident, &text).await?;
+            login_password(&bot, chat_id, &pool, &flows, &cipher, ident, &text).await?;
         }
     }
     Ok(())
 }
 
-async fn cmd_start(bot: &Bot, msg: &Message, pool: &PgPool) -> ResponseResult<()> {
+async fn cmd_start(
+    bot: &Bot,
+    msg: &Message,
+    pool: &PgPool,
+    cipher: &Cipher,
+) -> ResponseResult<()> {
     let tg = msg.from.as_ref().map(|u| u.id.0 as i64);
     match tg {
         Some(tg_id) => match profile_by_tg(pool, tg_id).await {
             Ok(Some(p)) => {
-                bot.send_message(
-                    msg.chat.id,
-                    format!(
-                        "Вы уже вошли как {} ✅\nUID: {}\nПодписка: {}",
-                        p.username,
-                        shown_uid(p.id, p.is_admin),
-                        format_sub(&p.sub_plan, p.sub_expires_at)
-                    ),
-                )
-                .await?;
+                let hwid = p.hwid_enc.as_deref().and_then(|h| decrypt(cipher, h));
+                send_cabinet(bot, msg.chat.id, &p, hwid).await?;
             }
             Ok(None) => send_welcome(bot, msg.chat.id).await?,
             Err(e) => {
@@ -228,7 +245,13 @@ async fn cmd_start(bot: &Bot, msg: &Message, pool: &PgPool) -> ResponseResult<()
 
 // ---------- колбэки ----------
 
-async fn on_callback(bot: Bot, q: CallbackQuery, pool: PgPool, flows: Flows) -> ResponseResult<()> {
+async fn on_callback(
+    bot: Bot,
+    q: CallbackQuery,
+    pool: PgPool,
+    flows: Flows,
+    cipher: Cipher,
+) -> ResponseResult<()> {
     // Убираем «часики» на кнопке.
     bot.answer_callback_query(q.id.clone()).await?;
     let chat_id = match &q.message {
@@ -241,6 +264,12 @@ async fn on_callback(bot: Bot, q: CallbackQuery, pool: PgPool, flows: Flows) -> 
         Some("cancel") => {
             flows.lock().unwrap().remove(&chat_id);
             bot.send_message(chat_id, "Отменено. /start — в начало.").await?;
+        }
+        Some("buy") => {
+            bot.send_message(chat_id, "Магазин подписок скоро откроется.").await?;
+        }
+        Some("key") => {
+            bot.send_message(chat_id, "Активация ключей скоро появится.").await?;
         }
         Some("login") => {
             flows.lock().unwrap().remove(&chat_id);
@@ -279,6 +308,7 @@ async fn on_callback(bot: Bot, q: CallbackQuery, pool: PgPool, flows: Flows) -> 
         }
         _ => {}
     }
+    let _ = cipher;
     Ok(())
 }
 
@@ -424,11 +454,18 @@ async fn reg_email(
 
     match row {
         Ok(Some((id,))) => {
-            bot.send_message(
-                chat_id,
-                format!("Готово! Аккаунт создан ✅\nВаш UID: {id}\nПодписка: нет\n\n/start — продолжить."),
-            )
-            .await?;
+            let p = Profile {
+                id,
+                telegram_id: tg_id,
+                username: username.clone(),
+                sub_plan: "none".to_string(),
+                sub_expires_at: None,
+                role: "user".to_string(),
+                hwid_enc: None,
+            };
+            bot.send_message(chat_id, format!("Готово! Аккаунт создан ✅\nВаш UID: {id}"))
+                .await?;
+            send_cabinet(bot, chat_id, &p, None).await?;
         }
         _ => {
             // Скорее всего гонка: такой логин/почта/телеграм уже заняты.
@@ -450,21 +487,25 @@ async fn login_password(
     chat_id: ChatId,
     pool: &PgPool,
     flows: &Flows,
+    cipher: &Cipher,
     ident: String,
     password: &str,
 ) -> ResponseResult<()> {
     let email_hash = sha_hex(&ident.trim().to_lowercase());
-    let row: Result<Option<(i64, String, String, String, bool, Option<DateTime<Utc>>)>, sqlx::Error> =
-        sqlx::query_as(
-            "SELECT id, username, password_hash, sub_plan, is_admin, sub_expires_at FROM users
-             WHERE username = $1 OR email_hash = $2",
-        )
-        .bind(&ident)
-        .bind(&email_hash)
-        .fetch_optional(pool)
-        .await;
+    let row: Result<
+        Option<(i64, i64, String, String, String, Option<DateTime<Utc>>, Option<String>)>,
+        sqlx::Error,
+    > = sqlx::query_as(
+        "SELECT id, telegram_id, username, password_hash, sub_plan, sub_expires_at, hwid_enc
+         FROM users WHERE username = $1 OR email_hash = $2",
+    )
+    .bind(&ident)
+    .bind(&email_hash)
+    .fetch_optional(pool)
+    .await;
 
-    let (id, username, pw_hash, sub_plan, is_admin, sub_exp) = match row {
+    // Роль подтягиваем отдельно, чтобы не ломать запрос, если колонки role еще нет.
+    let (id, _tg_old, username, pw_hash, sub_plan, sub_exp, hwid_enc) = match row {
         Ok(Some(r)) => r,
         _ => {
             flows.lock().unwrap().remove(&chat_id);
@@ -503,20 +544,144 @@ async fn login_password(
         return Ok(());
     }
 
+    let role: String = sqlx::query_scalar("SELECT role FROM users WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None)
+        .unwrap_or_else(|| "user".to_string());
+
     flows.lock().unwrap().remove(&chat_id);
-    bot.send_message(
-        chat_id,
-        format!(
-            "Вход выполнен ✅\nUID: {}\nЛогин: {username}\nПодписка: {}",
-            shown_uid(id, is_admin),
-            format_sub(&sub_plan, sub_exp)
-        ),
-    )
-    .await?;
+    bot.send_message(chat_id, "Вход выполнен ✅").await?;
+    let p = Profile {
+        id,
+        telegram_id: tg_id,
+        username,
+        sub_plan,
+        sub_expires_at: sub_exp,
+        role,
+        hwid_enc,
+    };
+    let hwid = p.hwid_enc.as_deref().and_then(|h| decrypt(cipher, h));
+    send_cabinet(bot, chat_id, &p, hwid).await?;
     Ok(())
 }
 
-// ---------- фото и тексты ----------
+// ---------- личный кабинет ----------
+
+async fn send_cabinet(
+    bot: &Bot,
+    chat_id: ChatId,
+    p: &Profile,
+    hwid: Option<String>,
+) -> ResponseResult<()> {
+    // 1. Фото с логином и аватаркой.
+    match render_profile_image(&p.username) {
+        Ok(png) => {
+            let path = std::env::temp_dir().join(format!("profile_{}.png", p.telegram_id));
+            if tokio::fs::write(&path, &png).await.is_ok() {
+                bot.send_photo(chat_id, InputFile::file(&path)).await.ok();
+            } else {
+                log::warn!("cannot write profile image to temp dir");
+            }
+        }
+        Err(e) => log::warn!("profile image skipped: {e}"),
+    }
+
+    // 2. Текст профиля + кнопки.
+    let text = format!(
+        "┌ Профиль ☁️\n├ Логин: {}\n├ Роль: {}\n├ Подписка: {}\n├ UID: {}\n├ ID: {}\n└ HWID: {}",
+        p.username,
+        role_display(&p.role),
+        cabinet_sub(&p.sub_plan, p.sub_expires_at),
+        shown_uid(p.id, &p.role),
+        p.telegram_id,
+        hwid.unwrap_or_else(|| "Не привязан".to_string()),
+    );
+    bot.send_message(chat_id, text)
+        .reply_markup(cabinet_keyboard())
+        .await?;
+    Ok(())
+}
+
+fn cabinet_sub(plan: &str, expires_at: Option<DateTime<Utc>>) -> String {
+    if plan == "none" {
+        return "неактивна".to_string();
+    }
+    format_sub(plan, expires_at)
+}
+
+/// Рисует баннер кабинета: слева `> логин`, справа круглая аватарка.
+fn render_profile_image(login: &str) -> Result<Vec<u8>, String> {
+    use image::{imageops::FilterType, GenericImageView, Rgb};
+
+    let bg = image::open(PROFILE_BG_PATH)
+        .map_err(|e| format!("no background: {e}"))?
+        .to_rgb8();
+    let (w, h) = (bg.width(), bg.height());
+    if w < 600 || h < 300 {
+        return Err("background too small".to_string());
+    }
+    let mut img = bg;
+
+    // Текст слева, как на баннере «Добро пожаловать».
+    let font =
+        ab_glyph::FontRef::try_from_slice(FONT_BYTES).map_err(|e| format!("no font: {e}"))?;
+    let mut scale = h as f32 * 0.11;
+    if login.chars().count() > 18 {
+        scale *= 18.0 / login.chars().count() as f32;
+    }
+    imageproc::drawing::draw_text_mut(
+        &mut img,
+        Rgb([255u8, 255u8, 255u8]),
+        (w as f32 * 0.085) as i32,
+        (h as f32 * 0.31) as i32,
+        scale,
+        &font,
+        &format!("> {login}"),
+    );
+
+    // Круглая аватарка справа.
+    let av = image::open(AVATAR_DEFAULT_PATH)
+        .map_err(|e| format!("no avatar: {e}"))?
+        .to_rgb8();
+    let d = (h as f32 * 0.34) as u32;
+    let av = image::imageops::resize(&av, d, d, FilterType::Lanczos3);
+    let cx = (w as f32 * 0.835) as i32;
+    let cy = (h as f32 * 0.41) as i32;
+    let r = d as f32 / 2.0;
+    let x0 = cx - d as i32 / 2;
+    let y0 = cy - d as i32 / 2;
+    for y in 0..d {
+        for x in 0..d {
+            let dx = x as f32 - r;
+            let dy = y as f32 - r;
+            if dx * dx + dy * dy <= r * r {
+                let (px, py) = (x0 + x as i32, y0 + y as i32);
+                if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
+                    img.put_pixel(px as u32, py as u32, *av.get_pixel(x, y));
+                }
+            }
+        }
+    }
+    // Белый ободок, как у иконки на баннере.
+    let ring = ((d / 45).max(2)) as i32;
+    for i in 0..ring {
+        imageproc::drawing::draw_hollow_circle_mut(
+            &mut img,
+            (cx, cy),
+            r as i32 - i,
+            Rgb([255u8, 255u8, 255u8]),
+        );
+    }
+
+    let mut buf = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+        .map_err(|e| format!("png encode: {e}"))?;
+    Ok(buf)
+}
+
+// ---------- фото приветствия / авторизации ----------
 
 async fn send_welcome(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
     if Path::new(WELCOME_PHOTO_PATH).exists() {
@@ -577,19 +742,33 @@ fn format_sub(plan: &str, expires_at: Option<DateTime<Utc>>) -> String {
 // ---------- работа с БД ----------
 
 async fn profile_by_tg(pool: &PgPool, tg_id: i64) -> Result<Option<Profile>, sqlx::Error> {
-    let row: Option<(i64, String, String, bool, Option<DateTime<Utc>>)> = sqlx::query_as(
-        "SELECT id, username, sub_plan, is_admin, sub_expires_at FROM users WHERE telegram_id = $1",
-    )
-    .bind(tg_id)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|(id, username, sub_plan, is_admin, sub_expires_at)| Profile {
-        id,
-        username,
-        sub_plan,
-        sub_expires_at,
-        is_admin,
-    }))
+    let row: Option<(i64, i64, String, String, Option<DateTime<Utc>>, Option<String>)> =
+        sqlx::query_as(
+            "SELECT id, telegram_id, username, sub_plan, sub_expires_at, hwid_enc
+             FROM users WHERE telegram_id = $1",
+        )
+        .bind(tg_id)
+        .fetch_optional(pool)
+        .await?;
+    // Роль читаем отдельно, чтобы не падать, если колонки role еще нет.
+    let mut out = None;
+    if let Some((id, telegram_id, username, sub_plan, sub_expires_at, hwid_enc)) = row {
+        let role: Option<String> = sqlx::query_scalar("SELECT role FROM users WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
+        out = Some(Profile {
+            id,
+            telegram_id,
+            username,
+            sub_plan,
+            sub_expires_at,
+            role: role.unwrap_or_else(|| "user".to_string()),
+            hwid_enc,
+        });
+    }
+    Ok(out)
 }
 
 async fn telegram_has_account(pool: &PgPool, tg_id: i64) -> Result<bool, sqlx::Error> {
@@ -645,6 +824,16 @@ fn encrypt(cipher: &Aes256Gcm, plain: &str) -> String {
     let mut v = nonce.to_vec();
     v.extend_from_slice(&ct);
     hex::encode(v)
+}
+
+fn decrypt(cipher: &Aes256Gcm, data_hex: &str) -> Option<String> {
+    let raw = hex::decode(data_hex).ok()?;
+    if raw.len() < 13 {
+        return None;
+    }
+    let (n, ct) = raw.split_at(12);
+    let pt = cipher.decrypt(Nonce::from_slice(n), ct).ok()?;
+    String::from_utf8(pt).ok()
 }
 
 fn sha_hex(s: &str) -> String {
