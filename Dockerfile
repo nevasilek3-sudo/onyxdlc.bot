@@ -1,5 +1,5 @@
 # Build
-FROM rust:stable-slim AS builder
+FROM rust:slim AS builder
 WORKDIR /app
 COPY Cargo.toml ./
 COPY src ./src
