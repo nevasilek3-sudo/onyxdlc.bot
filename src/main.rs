@@ -1,10 +1,34 @@
-use teloxide::{prelude::*, utils::command::BotCommands};
+use std::path::Path;
+
+use teloxide::{
+    prelude::*,
+    types::{
+        ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
+        MaybeInaccessibleMessage, UserId,
+    },
+    utils::command::BotCommands,
+};
 
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "Доступные команды:")]
 enum Command {
     #[command(description = "старт")]
     Start,
+}
+
+const WELCOME_TEXT: &str = "Привет! Добро пожаловать. Выберите действие";
+const WELCOME_PHOTO_PATH: &str = "assets/welcome.png";
+
+fn auth_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new([[
+        InlineKeyboardButton::callback("Войти", "login"),
+        InlineKeyboardButton::callback("Регистрация", "register"),
+    ]])
+}
+
+// TODO: заменить на проверку по БД. Пока все считаются неавторизованными.
+fn is_authorized(_user_id: UserId) -> bool {
+    false
 }
 
 #[tokio::main]
@@ -24,7 +48,15 @@ async fn main() {
 
     let bot = Bot::from_env();
 
-    Command::repl(bot, answer).await;
+    let handler = Update::filter_message()
+        .branch(
+            dptree::entry()
+                .filter_command::<Command>()
+                .endpoint(answer),
+        )
+        .branch(Update::filter_callback_query().endpoint(on_callback));
+
+    Dispatcher::builder(bot, handler).build().dispatch().await;
 }
 
 async fn run_health_server(port: u16) {
@@ -43,8 +75,49 @@ async fn run_health_server(port: u16) {
 async fn answer(bot: Bot, msg: Message, cmd: Command) -> ResponseResult<()> {
     match cmd {
         Command::Start => {
-            bot.send_message(msg.chat.id, "Привет! Заготовка бота работает.").await?;
+            let authorized = msg
+                .from
+                .as_ref()
+                .map(|u| is_authorized(u.id))
+                .unwrap_or(false);
+            if authorized {
+                bot.send_message(msg.chat.id, "Вы уже вошли ✅").await?;
+            } else {
+                send_welcome(&bot, msg.chat.id).await?;
+            }
         }
     }
+    Ok(())
+}
+
+async fn send_welcome(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
+    let keyboard = auth_keyboard();
+    if Path::new(WELCOME_PHOTO_PATH).exists() {
+        bot.send_photo(chat_id, InputFile::file(WELCOME_PHOTO_PATH))
+            .caption(WELCOME_TEXT)
+            .reply_markup(keyboard)
+            .await?;
+    } else {
+        // Фото не положили в assets/ — шлём тот же текст с кнопками.
+        bot.send_message(chat_id, WELCOME_TEXT)
+            .reply_markup(keyboard)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn on_callback(bot: Bot, q: CallbackQuery) -> ResponseResult<()> {
+    let text = match q.data.as_deref() {
+        Some("login") => "Раздел «Войти» скоро появится.",
+        Some("register") => "Раздел «Регистрация» скоро появится.",
+        _ => return Ok(()),
+    };
+    // Убираем «часики» на кнопке.
+    bot.answer_callback_query(q.id.clone()).await?;
+    let chat_id = match q.message {
+        Some(MaybeInaccessibleMessage::Regular(msg, _)) => msg.chat.id,
+        _ => ChatId(q.from.id.0 as i64),
+    };
+    bot.send_message(chat_id, text).await?;
     Ok(())
 }

@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 teloxide = { version = "0.14", features = ["macros"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+dptree = "0.3"
 axum = "0.7"
 dotenvy = "0.15"
 log = "0.4"

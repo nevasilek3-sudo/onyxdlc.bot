@@ -3,6 +3,7 @@ FROM rust:slim AS builder
 WORKDIR /app
 COPY Cargo.toml ./
 COPY src ./src
+COPY assets ./assets
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/* \
     && cargo build --release
 
