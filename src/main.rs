@@ -60,7 +60,9 @@ enum Flow {
     AdminRole {
         user_id: i64,
     },
-    AdminUploadLoader,
+    AdminUpload {
+        name: String,
+    },
 }
 
 struct Profile {
@@ -78,11 +80,12 @@ fn shown_uid(id: i64, role: &str) -> i64 {
     if role == "admin" { 0 } else { id }
 }
 
-fn role_display(role: &str) -> &'static str {
+fn role_display(role: &str) -> String {
     match role {
-        "admin" => "Администратор",
-        "media" => "Медиа",
-        _ => "Пользователь",
+        "admin" => "Администратор".to_string(),
+        "media" => "Медиа".to_string(),
+        "user" => "Пользователь".to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -148,7 +151,12 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(10000);
 
-    tokio::spawn(run_health_server(port));
+    let state = ApiState {
+        pool: pool.clone(),
+        cipher: cipher.clone(),
+        login_fails: Arc::new(Mutex::new(HashMap::new())),
+    };
+    tokio::spawn(run_health_server(port, state));
 
     let bot = Bot::from_env();
     let flows: Flows = Arc::new(Mutex::new(HashMap::new()));
@@ -164,12 +172,17 @@ async fn main() {
         .await;
 }
 
-async fn run_health_server(port: u16) {
-    use axum::{routing::get, Router};
+async fn run_health_server(port: u16, state: ApiState) {
+    use axum::{routing::{get, post}, Router};
 
     let app = Router::new()
         .route("/", get(|| async { "ok" }))
-        .route("/health", get(|| async { "ok" }));
+        .route("/health", get(|| async { "ok" }))
+        .route("/api/auth/login", post(api_login))
+        .route("/api/auth/heartbeat", post(api_heartbeat))
+        .route("/api/profile", post(api_profile))
+        .route("/api/dll", get(api_dll))
+        .with_state(state);
 
     let addr = format!("0.0.0.0:{port}");
     log::info!("Health server on {addr}");
@@ -270,9 +283,9 @@ async fn on_message(
         Some(Flow::AdminRole { user_id }) => {
             admin_set_role_text(&bot, chat_id, &pool, user_id, &text).await?;
         }
-        Some(Flow::AdminUploadLoader) => {
-            flows.lock().unwrap().insert(chat_id, Flow::AdminUploadLoader);
-            bot.send_message(chat_id, "Жду файл лоадера. Пришлите документ:")
+        Some(Flow::AdminUpload { name }) => {
+            flows.lock().unwrap().insert(chat_id, Flow::AdminUpload { name });
+            bot.send_message(chat_id, "Жду файл. Пришлите документ:")
                 .reply_markup(cancel_keyboard())
                 .await?;
         }
@@ -332,6 +345,7 @@ async fn on_callback(
         || data.starts_with("cu_")
         || data.starts_with("rk_")
         || data.starts_with("au_")
+        || data.starts_with("up_")
     {
         return admin_callback(&bot, chat_id, tg_id, &pool, &flows, &cipher, &data).await;
     }
@@ -1257,6 +1271,27 @@ async fn admin_callback(
                 .reply_markup(cancel_keyboard())
                 .await?;
         }
+        "adm_upload" => {
+            let kb = InlineKeyboardMarkup::new([
+                vec![InlineKeyboardButton::callback("Лоадер", "up_loader")],
+                vec![InlineKeyboardButton::callback("DLL клиента", "up_client_dll")],
+                vec![InlineKeyboardButton::callback("Отмена ✕", "cancel")],
+            ]);
+            bot.send_message(chat_id, "Какой файл заливаем?")
+                .reply_markup(kb)
+                .await?;
+        }
+        _ if data.starts_with("up_") => {
+            let name = match &data[3..] {
+                "loader" => "loader",
+                "client_dll" => "client_dll",
+                _ => return Ok(()),
+            };
+            flows.lock().unwrap().insert(chat_id, Flow::AdminUpload { name: name.to_string() });
+            bot.send_message(chat_id, format!("Пришлите файл ({name}) документом:"))
+                .reply_markup(cancel_keyboard())
+                .await?;
+        }
         _ if data.starts_with("nk_") => {
             let kind = data[3..].to_string();
             if kind == "custom" {
@@ -1663,13 +1698,14 @@ async fn on_document(
     doc: &Document,
 ) -> ResponseResult<()> {
     let chat_id = msg.chat.id;
-    let waiting = matches!(
-        flows.lock().unwrap().get(&chat_id),
-        Some(Flow::AdminUploadLoader)
-    );
-    if !waiting {
-        return Ok(());
-    }
+    let waiting: Option<String> = match flows.lock().unwrap().get(&chat_id) {
+        Some(Flow::AdminUpload { name }) => Some(name.clone()),
+        _ => None,
+    };
+    let bin_name = match waiting {
+        Some(n) => n,
+        None => return Ok(()),
+    };
     if require_admin(bot, chat_id, pool, tg_of(msg)).await?.is_none() {
         flows.lock().unwrap().remove(&chat_id);
         return Ok(());
@@ -1698,11 +1734,12 @@ async fn on_document(
     let enc = encrypt_bytes(cipher, &buf);
     let row: Result<Option<(i32,)>, sqlx::Error> = sqlx::query_as(
         "INSERT INTO binaries (name, data, sha256, version, updated_at)
-         VALUES ('loader', $1, $2, 1, now())
+         VALUES ($1, $2, $3, 1, now())
          ON CONFLICT (name) DO UPDATE SET data = EXCLUDED.data, sha256 = EXCLUDED.sha256,
              version = binaries.version + 1, updated_at = now()
          RETURNING version",
     )
+    .bind(&bin_name)
     .bind(&enc)
     .bind(&sha)
     .fetch_optional(pool)
@@ -1713,7 +1750,7 @@ async fn on_document(
             bot.send_message(
                 chat_id,
                 format!(
-                    "Лоадер обновлен ✅\nРазмер: {} КБ\nSHA256: {}…\nВерсия: v{v}",
+                    "Файл обновлен ✅\nЧто: {bin_name}\nРазмер: {} КБ\nSHA256: {}…\nВерсия: v{v}",
                     buf.len() / 1024,
                     &sha[..16]
                 ),
@@ -1911,4 +1948,357 @@ async fn admin_grant_custom(
         }
     }
     Ok(())
+}
+
+// ---------- backend API для лоадера ----------
+
+#[derive(Clone)]
+struct ApiState {
+    pool: PgPool,
+    cipher: Cipher,
+    login_fails: Arc<Mutex<HashMap<String, (u32, DateTime<Utc>)>>>,
+}
+
+#[derive(serde::Deserialize)]
+struct LoginReq {
+    ident: String,
+    password: String,
+    hwid: String,
+}
+
+#[derive(serde::Serialize)]
+struct LoginResp {
+    ok: bool,
+    error: String,
+    token: Option<String>,
+    uid: Option<i64>,
+    username: Option<String>,
+    role: Option<String>,
+    sub_plan: Option<String>,
+    sub_expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(serde::Deserialize)]
+struct TokenReq {
+    token: String,
+    hwid: String,
+}
+
+#[derive(serde::Serialize)]
+struct StatusResp {
+    ok: bool,
+    error: String,
+    uid: Option<i64>,
+    username: Option<String>,
+    role: Option<String>,
+    sub_plan: Option<String>,
+    sub_expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(serde::Deserialize)]
+struct DllQuery {
+    token: String,
+    hwid: String,
+}
+
+fn login_fail_resp(msg: &str) -> (axum::http::StatusCode, axum::Json<LoginResp>) {
+    (
+        axum::http::StatusCode::UNAUTHORIZED,
+        axum::Json(LoginResp {
+            ok: false,
+            error: msg.to_string(),
+            token: None,
+            uid: None,
+            username: None,
+            role: None,
+            sub_plan: None,
+            sub_expires_at: None,
+        }),
+    )
+}
+
+fn plan_active(plan: &str, exp: Option<DateTime<Utc>>) -> bool {
+    if plan == "none" {
+        return false;
+    }
+    if plan == "forever" {
+        return true;
+    }
+    exp.map(|e| e > Utc::now()).unwrap_or(false)
+}
+
+/// true = заблокировать (много неудач за 10 минут).
+fn throttle_check(state: &ApiState, key: &str) -> bool {
+    let mut m = state.login_fails.lock().unwrap();
+    if m.len() > 2000 {
+        m.clear();
+    }
+    let now = Utc::now();
+    let e = m.entry(key.to_string()).or_insert((0, now));
+    if (now - e.1).num_minutes() >= 10 {
+        *e = (0, now);
+    }
+    e.0 >= 8
+}
+
+fn throttle_hit(state: &ApiState, key: &str) {
+    let mut m = state.login_fails.lock().unwrap();
+    let e = m.entry(key.to_string()).or_insert((0, Utc::now()));
+    e.0 += 1;
+    e.1 = Utc::now();
+}
+
+fn gen_session_token() -> (String, String) {
+    use rand::RngCore;
+    let mut b = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut b);
+    let token = hex::encode(b);
+    let hash = sha_hex(&token);
+    (token, hash)
+}
+
+async fn check_session(pool: &PgPool, token: &str, hwid: &str) -> Option<i64> {
+    let h = sha_hex(token.trim());
+    let row: Option<(i64, Option<String>, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT s.user_id, u.hwid_hash, s.expires_at FROM sessions s
+         JOIN users u ON u.id = s.user_id WHERE s.token_hash = $1",
+    )
+    .bind(&h)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None)?;
+    let (uid, hwid_hash, exp) = row;
+    if exp <= Utc::now() {
+        return None;
+    }
+    if let Some(stored) = hwid_hash {
+        if stored != sha_hex(hwid.trim()) {
+            return None;
+        }
+    }
+    Some(uid)
+}
+
+async fn api_login(
+    axum::extract::State(s): axum::extract::State<ApiState>,
+    axum::Json(req): axum::Json<LoginReq>,
+) -> impl axum::response::IntoResponse {
+    use axum::http::StatusCode;
+    let ident = req.ident.trim().to_string();
+    if ident.is_empty() || req.password.is_empty() || req.hwid.trim().is_empty() {
+        return login_fail_resp("bad request");
+    }
+    let key = ident.to_lowercase();
+    if throttle_check(&s, &key) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            axum::Json(LoginResp {
+                ok: false,
+                error: "too many attempts".to_string(),
+                token: None,
+                uid: None,
+                username: None,
+                role: None,
+                sub_plan: None,
+                sub_expires_at: None,
+            }),
+        );
+    }
+
+    let email_hash = sha_hex(&key);
+    let row: Option<(i64, String, String, String, Option<DateTime<Utc>>, String)> =
+        sqlx::query_as(
+            "SELECT id, username, password_hash, sub_plan, sub_expires_at, role FROM users
+             WHERE username = $1 OR email_hash = $2",
+        )
+        .bind(&ident)
+        .bind(&email_hash)
+        .fetch_optional(&s.pool)
+        .await
+        .unwrap_or(None);
+    let fail = || {
+        throttle_hit(&s, &key);
+        login_fail_resp("invalid credentials")
+    };
+    let (id, username, pw_hash, sub_plan, sub_exp, role) = match row {
+        Some(r) => r,
+        None => return fail(),
+    };
+    let pw = req.password.clone();
+    let ok = tokio::task::spawn_blocking(move || verify_password(&pw_hash, &pw))
+        .await
+        .unwrap_or(false);
+    if !ok {
+        return fail();
+    }
+
+    // HWID: нет — привязываем, есть — сверяем.
+    let hw = sha_hex(req.hwid.trim());
+    let cur: Option<String> =
+        sqlx::query_scalar("SELECT hwid_hash FROM users WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&s.pool)
+            .await
+            .unwrap_or(None)
+            .flatten();
+    match cur {
+        None => {
+            let enc = encrypt(&s.cipher, req.hwid.trim());
+            if sqlx::query("UPDATE users SET hwid_hash = $1, hwid_enc = $2 WHERE id = $3")
+                .bind(&hw)
+                .bind(&enc)
+                .bind(id)
+                .execute(&s.pool)
+                .await
+                .is_err()
+            {
+                return login_fail_resp("temporary error");
+            }
+        }
+        Some(stored) if stored != hw => {
+            return (
+                StatusCode::FORBIDDEN,
+                axum::Json(LoginResp {
+                    ok: false,
+                    error: "hwid_mismatch".to_string(),
+                    token: None,
+                    uid: None,
+                    username: None,
+                    role: None,
+                    sub_plan: None,
+                    sub_expires_at: None,
+                }),
+            );
+        }
+        _ => {}
+    }
+
+    if !plan_active(&sub_plan, sub_exp) {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(LoginResp {
+                ok: false,
+                error: "sub_inactive".to_string(),
+                token: None,
+                uid: None,
+                username: None,
+                role: None,
+                sub_plan: None,
+                sub_expires_at: None,
+            }),
+        );
+    }
+
+    let (token, th) = gen_session_token();
+    let exp = Utc::now() + chrono::Duration::hours(24);
+    if sqlx::query(
+        "INSERT INTO sessions (token_hash, user_id, hwid_hash, expires_at) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(&th)
+    .bind(id)
+    .bind(&hw)
+    .bind(exp)
+    .execute(&s.pool)
+    .await
+    .is_err()
+    {
+        return login_fail_resp("temporary error");
+    }
+    (
+        StatusCode::OK,
+        axum::Json(LoginResp {
+            ok: true,
+            error: String::new(),
+            token: Some(token),
+            uid: Some(shown_uid(id, &role)),
+            username: Some(username),
+            role: Some(role),
+            sub_plan: Some(sub_plan),
+            sub_expires_at: sub_exp,
+        }),
+    )
+}
+
+async fn session_profile(
+    pool: &PgPool,
+    token: &str,
+    hwid: &str,
+) -> Option<(i64, String, String, String, Option<DateTime<Utc>>)> {
+    let uid = check_session(pool, token, hwid).await?;
+    let row: Option<(String, String, String, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT username, role, sub_plan, sub_expires_at FROM users WHERE id = $1",
+    )
+    .bind(uid)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None)?;
+    let (username, role, sub_plan, sub_exp) = row;
+    Some((uid, username, role, sub_plan, sub_exp))
+}
+
+async fn api_heartbeat(
+    axum::extract::State(s): axum::extract::State<ApiState>,
+    axum::Json(req): axum::Json<TokenReq>,
+) -> impl axum::response::IntoResponse {
+    use axum::http::StatusCode;
+    match session_profile(&s.pool, &req.token, &req.hwid).await {
+        Some((uid, username, role, sub_plan, sub_exp)) if plan_active(&sub_plan, sub_exp) => (
+            StatusCode::OK,
+            axum::Json(StatusResp {
+                ok: true,
+                error: String::new(),
+                uid: Some(shown_uid(uid, &role)),
+                username: Some(username),
+                role: Some(role),
+                sub_plan: Some(sub_plan),
+                sub_expires_at: sub_exp,
+            }),
+        ),
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(StatusResp {
+                ok: false,
+                error: "invalid session".to_string(),
+                uid: None,
+                username: None,
+                role: None,
+                sub_plan: None,
+                sub_expires_at: None,
+            }),
+        ),
+    }
+}
+
+async fn api_profile(
+    axum::extract::State(s): axum::extract::State<ApiState>,
+    axum::Json(req): axum::Json<TokenReq>,
+) -> impl axum::response::IntoResponse {
+    api_heartbeat(axum::extract::State(s), axum::Json(req)).await
+}
+
+async fn api_dll(
+    axum::extract::State(s): axum::extract::State<ApiState>,
+    axum::extract::Query(q): axum::extract::Query<DllQuery>,
+) -> impl axum::response::IntoResponse {
+    use axum::http::{header::CONTENT_TYPE, StatusCode};
+    let uid = match check_session(&s.pool, &q.token, &q.hwid).await {
+        Some(u) => u,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(CONTENT_TYPE, "text/plain")],
+                Vec::new(),
+            );
+        }
+    };
+    let _ = uid;
+    let row: Option<(Vec<u8>,)> =
+        sqlx::query_as("SELECT data FROM binaries WHERE name = 'client_dll'")
+            .fetch_optional(&s.pool)
+            .await
+            .unwrap_or(None);
+    match row.and_then(|(d,)| decrypt_bytes(&s.cipher, &d)) {
+        Some(bytes) => (StatusCode::OK, [(CONTENT_TYPE, "application/octet-stream")], bytes),
+        None => (StatusCode::NOT_FOUND, [(CONTENT_TYPE, "text/plain")], Vec::new()),
+    }
 }
