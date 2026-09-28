@@ -2136,7 +2136,7 @@ async fn api_login(
     // HWID: нет — привязываем, есть — сверяем.
     let hw = sha_hex(req.hwid.trim());
     let cur: Option<String> =
-        sqlx::query_scalar::<_, String>("SELECT hwid_hash FROM users WHERE id = $1")
+        sqlx::query_scalar::<_, Option<String>>("SELECT hwid_hash FROM users WHERE id = $1")
             .bind(id)
             .fetch_optional(&s.pool)
             .await
@@ -2226,14 +2226,15 @@ async fn session_profile(
     hwid: &str,
 ) -> Option<(i64, String, String, String, Option<DateTime<Utc>>)> {
     let uid = check_session(pool, token, hwid).await?;
-    let row: Option<(String, String, String, Option<DateTime<Utc>>)> = sqlx::query_as(
-        "SELECT username, role, sub_plan, sub_expires_at FROM users WHERE id = $1",
-    )
-    .bind(uid)
-    .fetch_optional(pool)
-    .await
-    .unwrap_or(None)?;
-    let (username, role, sub_plan, sub_exp) = row;
+    let row: Option<(String, String, String, Option<DateTime<Utc>>)> =
+        sqlx::query_as::<_, (String, String, String, Option<DateTime<Utc>>)>(
+            "SELECT username, role, sub_plan, sub_expires_at FROM users WHERE id = $1",
+        )
+        .bind(uid)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None);
+    let (username, role, sub_plan, sub_exp) = row?;
     Some((uid, username, role, sub_plan, sub_exp))
 }
 
