@@ -2059,15 +2059,16 @@ fn gen_session_token() -> (String, String) {
 
 async fn check_session(pool: &PgPool, token: &str, hwid: &str) -> Option<i64> {
     let h = sha_hex(token.trim());
-    let row: Option<(i64, Option<String>, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT s.user_id, u.hwid_hash, s.expires_at FROM sessions s
+    let row: Option<(i64, Option<String>, DateTime<Utc>)> =
+        sqlx::query_as::<_, (i64, Option<String>, DateTime<Utc>)>(
+            "SELECT s.user_id, u.hwid_hash, s.expires_at FROM sessions s
          JOIN users u ON u.id = s.user_id WHERE s.token_hash = $1",
-    )
-    .bind(&h)
-    .fetch_optional(pool)
-    .await
-    .unwrap_or(None)?;
-    let (uid, hwid_hash, exp) = row;
+        )
+        .bind(&h)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None);
+    let (uid, hwid_hash, exp) = row?;
     if exp <= Utc::now() {
         return None;
     }
@@ -2107,7 +2108,7 @@ async fn api_login(
 
     let email_hash = sha_hex(&key);
     let row: Option<(i64, String, String, String, Option<DateTime<Utc>>, String)> =
-        sqlx::query_as(
+        sqlx::query_as::<_, (i64, String, String, String, Option<DateTime<Utc>>, String)>(
             "SELECT id, username, password_hash, sub_plan, sub_expires_at, role FROM users
              WHERE username = $1 OR email_hash = $2",
         )
@@ -2135,7 +2136,7 @@ async fn api_login(
     // HWID: нет — привязываем, есть — сверяем.
     let hw = sha_hex(req.hwid.trim());
     let cur: Option<String> =
-        sqlx::query_scalar("SELECT hwid_hash FROM users WHERE id = $1")
+        sqlx::query_scalar::<_, String>("SELECT hwid_hash FROM users WHERE id = $1")
             .bind(id)
             .fetch_optional(&s.pool)
             .await
@@ -2293,7 +2294,7 @@ async fn api_dll(
     };
     let _ = uid;
     let row: Option<(Vec<u8>,)> =
-        sqlx::query_as("SELECT data FROM binaries WHERE name = 'client_dll'")
+        sqlx::query_as::<_, (Vec<u8>,)>("SELECT data FROM binaries WHERE name = 'client_dll'")
             .fetch_optional(&s.pool)
             .await
             .unwrap_or(None);
