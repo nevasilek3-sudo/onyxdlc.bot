@@ -182,6 +182,7 @@ async fn run_health_server(port: u16, state: ApiState) {
         .route("/api/auth/heartbeat", post(api_heartbeat))
         .route("/api/profile", post(api_profile))
         .route("/api/dll", get(api_dll))
+        .route("/api/dll/info", get(api_dll_info))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{port}");
@@ -2302,5 +2303,40 @@ async fn api_dll(
     match row.and_then(|(d,)| decrypt_bytes(&s.cipher, &d)) {
         Some(bytes) => (StatusCode::OK, [(CONTENT_TYPE, "application/octet-stream")], bytes),
         None => (StatusCode::NOT_FOUND, [(CONTENT_TYPE, "text/plain")], Vec::new()),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct DllInfoResp {
+    ok: bool,
+    sha256: Option<String>,
+    version: Option<i32>,
+}
+
+async fn api_dll_info(
+    axum::extract::State(s): axum::extract::State<ApiState>,
+    axum::extract::Query(q): axum::extract::Query<DllQuery>,
+) -> impl axum::response::IntoResponse {
+    use axum::http::StatusCode;
+    if check_session(&s.pool, &q.token, &q.hwid).await.is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(DllInfoResp { ok: false, sha256: None, version: None }),
+        );
+    }
+    let row: Option<(String, i32)> =
+        sqlx::query_as::<_, (String, i32)>("SELECT sha256, version FROM binaries WHERE name = 'client_dll'")
+            .fetch_optional(&s.pool)
+            .await
+            .unwrap_or(None);
+    match row {
+        Some((sha, v)) => (
+            StatusCode::OK,
+            axum::Json(DllInfoResp { ok: true, sha256: Some(sha), version: Some(v) }),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            axum::Json(DllInfoResp { ok: false, sha256: None, version: None }),
+        ),
     }
 }
