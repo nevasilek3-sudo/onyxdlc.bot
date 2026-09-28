@@ -16,6 +16,7 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use teloxide::{
+    net::Download,
     prelude::*,
     types::{ChatId, Document, InlineKeyboardButton, InlineKeyboardMarkup, InputFile},
 };
@@ -268,6 +269,12 @@ async fn on_message(
         }
         Some(Flow::AdminRole { user_id }) => {
             admin_set_role_text(&bot, chat_id, &pool, user_id, &text).await?;
+        }
+        Some(Flow::AdminUploadLoader) => {
+            flows.lock().unwrap().insert(chat_id, Flow::AdminUploadLoader);
+            bot.send_message(chat_id, "Жду файл лоадера. Пришлите документ:")
+                .reply_markup(cancel_keyboard())
+                .await?;
         }
     }
     Ok(())
@@ -1667,7 +1674,7 @@ async fn on_document(
         flows.lock().unwrap().remove(&chat_id);
         return Ok(());
     }
-    let size = doc.file.size.unwrap_or(0);
+    let size = doc.file.size;
     if size == 0 || size > 20 * 1024 * 1024 {
         bot.send_message(chat_id, "Файл должен быть до 20 МБ. Пришлите другой:")
             .reply_markup(cancel_keyboard())
