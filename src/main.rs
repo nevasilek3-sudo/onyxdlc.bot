@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use teloxide::{
     prelude::*,
-    types::{ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile},
+    types::{ChatId, Document, InlineKeyboardButton, InlineKeyboardMarkup, InputFile},
 };
 
 // ---------- константы ----------
@@ -50,6 +50,16 @@ enum Flow {
     AdminNewKey {
         kind: String,
     },
+    AdminNewCustom {
+        uses: i32,
+    },
+    AdminGrantCustom {
+        user_id: i64,
+    },
+    AdminRole {
+        user_id: i64,
+    },
+    AdminUploadLoader,
 }
 
 struct Profile {
@@ -85,13 +95,14 @@ fn auth_keyboard() -> InlineKeyboardMarkup {
 }
 
 fn cancel_keyboard() -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup::new([[InlineKeyboardButton::callback("✕ Отмена", "cancel")]])
+    InlineKeyboardMarkup::new([[InlineKeyboardButton::callback("Отмена ✕", "cancel")]])
 }
 
 fn cabinet_keyboard(is_admin: bool) -> InlineKeyboardMarkup {
     let mut kb = vec![
         vec![InlineKeyboardButton::callback("Купить подписку 💳", "buy")],
         vec![InlineKeyboardButton::callback("Активировать ключ 🔑", "key")],
+        vec![InlineKeyboardButton::callback("Скачать лоадер 📥", "dl")],
     ];
     if is_admin {
         kb.push(vec![InlineKeyboardButton::callback("🛠 Админ-панель", "admin")]);
@@ -192,6 +203,10 @@ async fn on_message(
         return cmd_start(&bot, &msg, &pool, &cipher).await;
     }
 
+    if let Some(doc) = msg.document() {
+        return on_document(&bot, &msg, &pool, &flows, &cipher, doc).await;
+    }
+
     if text.is_empty() {
         return Ok(());
     }
@@ -244,6 +259,15 @@ async fn on_message(
         Some(Flow::AdminNewKey { kind }) => {
             flows.lock().unwrap().insert(chat_id, Flow::AdminNewKey { kind });
             bot.send_message(chat_id, "Выберите параметры кнопками выше.").await?;
+        }
+        Some(Flow::AdminNewCustom { uses }) => {
+            admin_new_custom(&bot, chat_id, &pool, tg_of(&msg), uses, &text).await?;
+        }
+        Some(Flow::AdminGrantCustom { user_id }) => {
+            admin_grant_custom(&bot, chat_id, &pool, user_id, &text).await?;
+        }
+        Some(Flow::AdminRole { user_id }) => {
+            admin_set_role_text(&bot, chat_id, &pool, user_id, &text).await?;
         }
     }
     Ok(())
@@ -298,6 +322,9 @@ async fn on_callback(
         || data.starts_with("nk_")
         || data.starts_with("nu_")
         || data.starts_with("gk_")
+        || data.starts_with("cu_")
+        || data.starts_with("rk_")
+        || data.starts_with("au_")
     {
         return admin_callback(&bot, chat_id, tg_id, &pool, &flows, &cipher, &data).await;
     }
@@ -317,6 +344,9 @@ async fn on_callback(
             flows.lock().unwrap().insert(chat_id, Flow::KeyActivate);
             send_simple_photo(&bot, chat_id, KEYS_PHOTO_PATH, "🔑 Введите ключ активации:")
                 .await?;
+        }
+        Some("dl") => {
+            user_download(&bot, chat_id, tg_id, &pool, &cipher).await?;
         }
         Some("login") => {
             flows.lock().unwrap().remove(&chat_id);
@@ -867,6 +897,7 @@ fn tariff_name(kind: &str) -> &'static str {
         "d360" => "360 дней",
         "forever" => "Навсегда",
         "hwid" => "Сброс HWID",
+        "custom" => "Кастом",
         _ => "?",
     }
 }
@@ -990,7 +1021,12 @@ fn gen_key_code() -> String {
 }
 
 /// Выдача подписки юзеру. Продлевает активную, иначе считает от сейчас.
-async fn grant_sub(pool: &PgPool, user_id: i64, kind: &str) -> Result<String, sqlx::Error> {
+async fn grant_sub(
+    pool: &PgPool,
+    user_id: i64,
+    kind: &str,
+    custom_hours: Option<i64>,
+) -> Result<String, sqlx::Error> {
     if kind == "forever" {
         sqlx::query(
             "UPDATE users SET sub_plan = 'forever', sub_issued_at = now(), sub_expires_at = NULL WHERE id = $1",
@@ -1000,7 +1036,11 @@ async fn grant_sub(pool: &PgPool, user_id: i64, kind: &str) -> Result<String, sq
         .await?;
         return Ok("навсегда".to_string());
     }
-    let days = tariff_days(kind).unwrap_or(30);
+    let hours: i64 = if kind == "custom" {
+        custom_hours.unwrap_or(24)
+    } else {
+        tariff_days(kind).unwrap_or(30) * 24
+    };
     let cur: Option<DateTime<Utc>> =
         sqlx::query_scalar("SELECT sub_expires_at FROM users WHERE id = $1")
             .bind(user_id)
@@ -1011,7 +1051,7 @@ async fn grant_sub(pool: &PgPool, user_id: i64, kind: &str) -> Result<String, sq
         Some(e) if e > Utc::now() => e,
         _ => Utc::now(),
     };
-    let exp = base + chrono::Duration::days(days);
+    let exp = base + chrono::Duration::hours(hours);
     sqlx::query(
         "UPDATE users SET sub_plan = $1, sub_issued_at = now(), sub_expires_at = $2 WHERE id = $3",
     )
@@ -1020,7 +1060,11 @@ async fn grant_sub(pool: &PgPool, user_id: i64, kind: &str) -> Result<String, sq
     .bind(user_id)
     .execute(pool)
     .await?;
-    Ok(format!("{} (до {})", tariff_name(kind), exp.format("%d.%m.%Y")))
+    if kind == "custom" {
+        Ok(format!("Кастом ({} ч., до {})", hours, exp.format("%d.%m.%Y %H:%M")))
+    } else {
+        Ok(format!("{} (до {})", tariff_name(kind), exp.format("%d.%m.%Y")))
+    }
 }
 
 async fn activate_key(
@@ -1030,15 +1074,15 @@ async fn activate_key(
     code_raw: &str,
 ) -> ResponseResult<()> {
     let code = code_raw.trim().to_uppercase();
-    let row: Option<(String, i32, i32, bool)> = sqlx::query_as(
-        "SELECT kind, max_uses, used_count, revoked FROM keys WHERE code = $1",
+    let row: Option<(String, i32, i32, bool, Option<i32>)> = sqlx::query_as(
+        "SELECT kind, max_uses, used_count, revoked, duration_hours FROM keys WHERE code = $1",
     )
     .bind(&code)
     .fetch_optional(pool)
     .await
     .unwrap_or(None);
 
-    let (kind, max_uses, used_count, revoked) = match row {
+    let (kind, max_uses, used_count, revoked, duration_hours) = match row {
         Some(r) => r,
         None => {
             bot.send_message(chat_id, "Такой ключ не найден. Проверьте код.").await?;
@@ -1089,7 +1133,7 @@ async fn activate_key(
             return Ok(());
         }
     };
-    match grant_sub(pool, user_id, &kind).await {
+    match grant_sub(pool, user_id, &kind, duration_hours.map(i64::from)).await {
         Ok(desc) => {
             sqlx::query("UPDATE keys SET used_count = used_count + 1, last_used_at = now() WHERE code = $1")
                 .bind(&code)
@@ -1111,12 +1155,13 @@ async fn activate_key(
 
 fn admin_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new([
-        [InlineKeyboardButton::callback("👥 Найти юзера", "adm_find")],
-        [InlineKeyboardButton::callback("🔑 Создать ключ", "adm_newkey")],
-        [InlineKeyboardButton::callback("🗑 Удалить ключ", "adm_delkey")],
-        [InlineKeyboardButton::callback("📋 Список ключей", "adm_keys")],
-        [InlineKeyboardButton::callback("💳 Выдать подписку", "adm_grant")],
-        [InlineKeyboardButton::callback("◀️ Назад", "cabinet")],
+        [InlineKeyboardButton::callback("Найти юзера 👥", "adm_find")],
+        [InlineKeyboardButton::callback("Создать ключ 🔑", "adm_newkey")],
+        [InlineKeyboardButton::callback("Удалить ключ 🗑", "adm_delkey")],
+        [InlineKeyboardButton::callback("Список ключей 📋", "adm_keys")],
+        [InlineKeyboardButton::callback("Выдать подписку 💳", "adm_grant")],
+        [InlineKeyboardButton::callback("Залить лоадер 📤", "adm_upload")],
+        [InlineKeyboardButton::callback("Назад ◀️", "cabinet")],
     ])
 }
 
@@ -1160,7 +1205,8 @@ fn kind_buttons(prefix: &str) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new([
         vec![b("30 дней", "d30"), b("120 дней", "d120"), b("240 дней", "d240")],
         vec![b("360 дней", "d360"), b("Навсегда", "forever"), b("Сброс HWID", "hwid")],
-        vec![InlineKeyboardButton::callback("✕ Отмена", "cancel")],
+        vec![b("Кастом ⏳", "custom")],
+        vec![InlineKeyboardButton::callback("Отмена ✕", "cancel")],
     ])
 }
 
@@ -1206,27 +1252,102 @@ async fn admin_callback(
         }
         _ if data.starts_with("nk_") => {
             let kind = data[3..].to_string();
-            flows.lock().unwrap().insert(chat_id, Flow::AdminNewKey { kind: kind.clone() });
-            let kb = InlineKeyboardMarkup::new([
-                vec![
-                    InlineKeyboardButton::callback("1", "nu_1"),
-                    InlineKeyboardButton::callback("3", "nu_3"),
-                    InlineKeyboardButton::callback("5", "nu_5"),
-                    InlineKeyboardButton::callback("10", "nu_10"),
-                    InlineKeyboardButton::callback("∞", "nu_0"),
-                ],
-                vec![InlineKeyboardButton::callback("✕ Отмена", "cancel")],
-            ]);
-            bot.send_message(chat_id, format!("Тип: {}. Сколько активаций?", tariff_name(&kind)))
-                .reply_markup(kb)
+            if kind == "custom" {
+                bot.send_message(chat_id, "Кастомный ключ: сколько активаций?")
+                    .reply_markup(uses_keyboard("cu_"))
+                    .await?;
+            } else {
+                flows.lock().unwrap().insert(chat_id, Flow::AdminNewKey { kind: kind.clone() });
+                bot.send_message(chat_id, format!("Тип: {}. Сколько активаций?", tariff_name(&kind)))
+                    .reply_markup(uses_keyboard("nu_"))
+                    .await?;
+            }
+        }
+        _ if data.starts_with("cu_") => {
+            let uses: i32 = data[3..].parse().unwrap_or(1);
+            flows.lock().unwrap().insert(chat_id, Flow::AdminNewCustom { uses });
+            bot.send_message(chat_id, "На сколько часов ключ? (1–8760):")
+                .reply_markup(cancel_keyboard())
                 .await?;
+        }
+        _ if data.starts_with("rk_") => {
+            // rk_<роль>_<uid>, роль без подчеркиваний.
+            let rest = &data[3..];
+            match rest.rsplit_once('_') {
+                Some((role, id_s)) => match id_s.parse::<i64>() {
+                    Ok(uid) => admin_set_role(bot, chat_id, pool, flows, uid, role).await?,
+                    Err(_) => {
+                        bot.send_message(chat_id, "Что-то не так, попробуйте снова.").await?;
+                    }
+                },
+                None => {
+                    bot.send_message(chat_id, "Что-то не так, попробуйте снова.").await?;
+                }
+            }
+        }
+        _ if data.starts_with("au_") => {
+            let parts: Vec<&str> = data.split('_').collect();
+            if parts.len() != 3 {
+                return Ok(());
+            }
+            let uid: i64 = parts[2].parse().unwrap_or(0);
+            match parts[1] {
+                "grant" => {
+                    let exists: Option<(i64,)> =
+                        sqlx::query_as("SELECT id FROM users WHERE id = $1")
+                            .bind(uid)
+                            .fetch_optional(pool)
+                            .await
+                            .unwrap_or(None);
+                    if exists.is_none() {
+                        bot.send_message(chat_id, "Юзер не найден.").await?;
+                        return Ok(());
+                    }
+                    flows.lock().unwrap().insert(chat_id, Flow::AdminGrant { user_id: Some(uid) });
+                    bot.send_message(chat_id, format!("UID {uid}: какой тариф выдаем?"))
+                        .reply_markup(kind_buttons("gk_"))
+                        .await?;
+                }
+                "hwid" => {
+                    match sqlx::query("UPDATE users SET hwid_hash = NULL, hwid_enc = NULL WHERE id = $1")
+                        .bind(uid)
+                        .execute(pool)
+                        .await
+                    {
+                        Ok(r) if r.rows_affected() > 0 => {
+                            bot.send_message(chat_id, format!("HWID сброшен (UID {uid}).")).await?;
+                        }
+                        _ => {
+                            bot.send_message(chat_id, "Юзер не найден.").await?;
+                        }
+                    }
+                }
+                "role" => {
+                    admin_role_menu(bot, chat_id, uid).await?;
+                }
+                "revoke" => {
+                    match sqlx::query("UPDATE users SET sub_plan = 'none', sub_expires_at = NULL WHERE id = $1")
+                        .bind(uid)
+                        .execute(pool)
+                        .await
+                    {
+                        Ok(r) if r.rows_affected() > 0 => {
+                            bot.send_message(chat_id, format!("Подписка забрана (UID {uid}).")).await?;
+                        }
+                        _ => {
+                            bot.send_message(chat_id, "Юзер не найден.").await?;
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
         _ if data.starts_with("nu_") => {
             let max_uses: i32 = data[3..].parse().unwrap_or(1);
             let flow = flows.lock().unwrap().remove(&chat_id);
             match flow {
                 Some(Flow::AdminNewKey { kind }) => {
-                    create_key(bot, chat_id, pool, tg_id, &kind, max_uses).await?;
+                    create_key(bot, chat_id, pool, tg_id, &kind, max_uses, None).await?;
                 }
                 _ => {
                     bot.send_message(chat_id, "Сначала выберите тип ключа.").await?;
@@ -1238,7 +1359,29 @@ async fn admin_callback(
             let flow = flows.lock().unwrap().remove(&chat_id);
             match flow {
                 Some(Flow::AdminGrant { user_id: Some(uid) }) => {
-                    match grant_sub(pool, uid, &kind).await {
+                    if kind == "custom" {
+                        flows.lock().unwrap().insert(chat_id, Flow::AdminGrantCustom { user_id: uid });
+                        bot.send_message(chat_id, "На сколько часов выдать? (1–8760):")
+                            .reply_markup(cancel_keyboard())
+                            .await?;
+                        return Ok(());
+                    }
+                    if kind == "hwid" {
+                        match sqlx::query("UPDATE users SET hwid_hash = NULL, hwid_enc = NULL WHERE id = $1")
+                            .bind(uid)
+                            .execute(pool)
+                            .await
+                        {
+                            Ok(r) if r.rows_affected() > 0 => {
+                                bot.send_message(chat_id, format!("HWID сброшен (UID {uid}).")).await?;
+                            }
+                            _ => {
+                                bot.send_message(chat_id, "Юзер не найден.").await?;
+                            }
+                        }
+                        return Ok(());
+                    }
+                    match grant_sub(pool, uid, &kind, None).await {
                         Ok(desc) => {
                             bot.send_message(
                                 chat_id,
@@ -1271,24 +1414,30 @@ async fn create_key(
     tg_id: i64,
     kind: &str,
     max_uses: i32,
+    duration_hours: Option<i32>,
 ) -> ResponseResult<()> {
     for _ in 0..5 {
         let code = gen_key_code();
         let r = sqlx::query(
-            "INSERT INTO keys (code, kind, max_uses, created_by) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO keys (code, kind, max_uses, created_by, duration_hours) VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(&code)
         .bind(kind)
         .bind(max_uses)
         .bind(tg_id)
+        .bind(duration_hours)
         .execute(pool)
         .await;
         match r {
             Ok(_) => {
+                let extra = match kind {
+                    "custom" => format!(" ({} ч.)", duration_hours.unwrap_or(24)),
+                    _ => String::new(),
+                };
                 bot.send_message(
                     chat_id,
                     format!(
-                        "🔑 Ключ создан:\n{code}\nТип: {}\nАктиваций: {}",
+                        "🔑 Ключ создан:\n{code}\nТип: {}{extra}\nАктиваций: {}",
                         tariff_name(kind),
                         uses_display(max_uses)
                     ),
@@ -1307,8 +1456,8 @@ async fn create_key(
 }
 
 async fn admin_keys_list(bot: &Bot, chat_id: ChatId, pool: &PgPool) -> ResponseResult<()> {
-    let rows: Vec<(String, String, i32, i32, bool, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT code, kind, max_uses, used_count, revoked, created_at
+    let rows: Vec<(String, String, i32, i32, bool, DateTime<Utc>, Option<i32>)> = sqlx::query_as(
+        "SELECT code, kind, max_uses, used_count, revoked, created_at, duration_hours
          FROM keys ORDER BY created_at DESC LIMIT 15",
     )
     .fetch_all(pool)
@@ -1319,11 +1468,15 @@ async fn admin_keys_list(bot: &Bot, chat_id: ChatId, pool: &PgPool) -> ResponseR
         return Ok(());
     }
     let mut out = String::from("📋 Последние ключи:\n");
-    for (code, kind, max_uses, used_count, revoked, created) in rows {
+    for (code, kind, max_uses, used_count, revoked, created, dur) in rows {
         let mark = if revoked { " ⛔" } else { "" };
+        let what = if kind == "custom" {
+            format!("Кастом {}ч.", dur.unwrap_or(24))
+        } else {
+            tariff_name(&kind).to_string()
+        };
         out.push_str(&format!(
-            "\n{code} — {} — {}/{} — {}{mark}",
-            tariff_name(&kind),
+            "\n{code} — {what} — {}/{} — {}{mark}",
             used_count,
             uses_display(max_uses),
             created.format("%d.%m"),
@@ -1374,6 +1527,16 @@ async fn admin_find(
                 .as_deref()
                 .and_then(|h| decrypt(cipher, h))
                 .unwrap_or_else(|| "Не привязан".to_string());
+            let kb = InlineKeyboardMarkup::new([
+                vec![
+                    InlineKeyboardButton::callback("Выдать сабку 💳", format!("au_grant_{id}")),
+                    InlineKeyboardButton::callback("Сбросить HWID 🔄", format!("au_hwid_{id}")),
+                ],
+                vec![
+                    InlineKeyboardButton::callback("Выдать роль 🎭", format!("au_role_{id}")),
+                    InlineKeyboardButton::callback("Забрать сабку 🚫", format!("au_revoke_{id}")),
+                ],
+            ]);
             bot.send_message(
                 chat_id,
                 format!(
@@ -1383,6 +1546,7 @@ async fn admin_find(
                     created.format("%d.%m.%Y"),
                 ),
             )
+            .reply_markup(kb)
             .await?;
         }
     }
@@ -1444,6 +1608,299 @@ async fn admin_grant_target(
             bot.send_message(chat_id, format!("Юзер: {username} (UID {uid}). Какой тариф выдаем?"))
                 .reply_markup(kind_buttons("gk_"))
                 .await?;
+        }
+    }
+    Ok(())
+}
+
+// ---------- скачивание лоадера ----------
+
+const LOADER_FILE_NAME: &str = "ardor-gaming-rage_instrukcia_131930_22062026.pdf";
+
+fn tg_of(msg: &Message) -> i64 {
+    msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0)
+}
+
+fn sub_active(p: &Profile) -> bool {
+    if p.sub_plan == "none" {
+        return false;
+    }
+    if p.sub_plan == "forever" {
+        return true;
+    }
+    p.sub_expires_at.map(|e| e > Utc::now()).unwrap_or(false)
+}
+
+fn encrypt_bytes(cipher: &Aes256Gcm, data: &[u8]) -> Vec<u8> {
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let ct = cipher.encrypt(&nonce, data).expect("encryption failed");
+    let mut v = nonce.to_vec();
+    v.extend_from_slice(&ct);
+    v
+}
+
+fn decrypt_bytes(cipher: &Aes256Gcm, raw: &[u8]) -> Option<Vec<u8>> {
+    if raw.len() < 13 {
+        return None;
+    }
+    let (n, ct) = raw.split_at(12);
+    cipher.decrypt(Nonce::from_slice(n), ct).ok()
+}
+
+async fn on_document(
+    bot: &Bot,
+    msg: &Message,
+    pool: &PgPool,
+    flows: &Flows,
+    cipher: &Cipher,
+    doc: &Document,
+) -> ResponseResult<()> {
+    let chat_id = msg.chat.id;
+    let waiting = matches!(
+        flows.lock().unwrap().get(&chat_id),
+        Some(Flow::AdminUploadLoader)
+    );
+    if !waiting {
+        return Ok(());
+    }
+    if require_admin(bot, chat_id, pool, tg_of(msg)).await?.is_none() {
+        flows.lock().unwrap().remove(&chat_id);
+        return Ok(());
+    }
+    let size = doc.file.size.unwrap_or(0);
+    if size == 0 || size > 20 * 1024 * 1024 {
+        bot.send_message(chat_id, "Файл должен быть до 20 МБ. Пришлите другой:")
+            .reply_markup(cancel_keyboard())
+            .await?;
+        return Ok(());
+    }
+    let file = match bot.get_file(&doc.file.id).await {
+        Ok(f) => f,
+        Err(e) => {
+            log::error!("get_file failed: {e}");
+            bot.send_message(chat_id, "Не скачался, попробуйте еще раз.").await?;
+            return Ok(());
+        }
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    if bot.download_file(&file.path, &mut buf).await.is_err() {
+        bot.send_message(chat_id, "Не скачался, попробуйте еще раз.").await?;
+        return Ok(());
+    }
+    let sha = hex::encode(Sha256::digest(&buf));
+    let enc = encrypt_bytes(cipher, &buf);
+    let row: Result<Option<(i32,)>, sqlx::Error> = sqlx::query_as(
+        "INSERT INTO binaries (name, data, sha256, version, updated_at)
+         VALUES ('loader', $1, $2, 1, now())
+         ON CONFLICT (name) DO UPDATE SET data = EXCLUDED.data, sha256 = EXCLUDED.sha256,
+             version = binaries.version + 1, updated_at = now()
+         RETURNING version",
+    )
+    .bind(&enc)
+    .bind(&sha)
+    .fetch_optional(pool)
+    .await;
+    flows.lock().unwrap().remove(&chat_id);
+    match row {
+        Ok(Some((v,))) => {
+            bot.send_message(
+                chat_id,
+                format!(
+                    "Лоадер обновлен ✅\nРазмер: {} КБ\nSHA256: {}…\nВерсия: v{v}",
+                    buf.len() / 1024,
+                    &sha[..16]
+                ),
+            )
+            .await?;
+        }
+        _ => {
+            log::error!("binaries upsert failed");
+            bot.send_message(chat_id, "Временная ошибка, попробуйте позже.").await?;
+        }
+    }
+    Ok(())
+}
+
+async fn user_download(
+    bot: &Bot,
+    chat_id: ChatId,
+    tg_id: i64,
+    pool: &PgPool,
+    cipher: &Cipher,
+) -> ResponseResult<()> {
+    let p = match profile_by_tg(pool, tg_id).await {
+        Ok(Some(p)) => p,
+        _ => {
+            bot.send_message(chat_id, "Нажмите /start, чтобы начать.").await?;
+            return Ok(());
+        }
+    };
+    if !sub_active(&p) {
+        bot.send_message(chat_id, "Нужна активная подписка 💳\nЗагляните в магазин.").await?;
+        return Ok(());
+    }
+    let row: Option<(Vec<u8>,)> =
+        sqlx::query_as("SELECT data FROM binaries WHERE name = 'loader'")
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
+    let bytes = match row.and_then(|(d,)| decrypt_bytes(cipher, &d)) {
+        Some(b) => b,
+        None => {
+            bot.send_message(chat_id, "Файл пока не загружен. Обратитесь к @NeVasilek.").await?;
+            return Ok(());
+        }
+    };
+    let path = std::env::temp_dir().join(LOADER_FILE_NAME);
+    if tokio::fs::write(&path, &bytes).await.is_err() {
+        bot.send_message(chat_id, "Временная ошибка, попробуйте позже.").await?;
+        return Ok(());
+    }
+    bot.send_document(chat_id, InputFile::file(&path))
+        .caption("Ваш лоадер. Переименовывать не нужно — запускайте как есть.")
+        .await?;
+    Ok(())
+}
+
+// ---------- роли и кастом ----------
+
+fn uses_keyboard(prefix: &str) -> InlineKeyboardMarkup {
+    let b = |t: &str, n: &str| InlineKeyboardButton::callback(t, format!("{prefix}{n}"));
+    InlineKeyboardMarkup::new([
+        vec![b("1", "1"), b("3", "3"), b("5", "5"), b("10", "10"), b("∞", "0")],
+        vec![InlineKeyboardButton::callback("Отмена ✕", "cancel")],
+    ])
+}
+
+async fn admin_role_menu(bot: &Bot, chat_id: ChatId, user_id: i64) -> ResponseResult<()> {
+    let b = |t: &str, r: &str| {
+        InlineKeyboardButton::callback(t, format!("rk_{r}_{user_id}"))
+    };
+    let kb = InlineKeyboardMarkup::new([
+        vec![b("Пользователь", "user"), b("Медиа", "media"), b("Администратор", "admin")],
+        vec![b("Своя ✏️", "custom")],
+        vec![InlineKeyboardButton::callback("Отмена ✕", "cancel")],
+    ]);
+    bot.send_message(chat_id, format!("UID {user_id}: какую роль выдать?"))
+        .reply_markup(kb)
+        .await?;
+    Ok(())
+}
+
+async fn admin_set_role(
+    bot: &Bot,
+    chat_id: ChatId,
+    pool: &PgPool,
+    flows: &Flows,
+    user_id: i64,
+    role: &str,
+) -> ResponseResult<()> {
+    if role == "custom" {
+        flows.lock().unwrap().insert(chat_id, Flow::AdminRole { user_id });
+        bot.send_message(chat_id, "Введите название роли (1–32 символа: буквы, цифры, _, -, пробел):")
+            .reply_markup(cancel_keyboard())
+            .await?;
+        return Ok(());
+    }
+    match sqlx::query("UPDATE users SET role = $1 WHERE id = $2")
+        .bind(role)
+        .bind(user_id)
+        .execute(pool)
+        .await
+    {
+        Ok(r) if r.rows_affected() > 0 => {
+            bot.send_message(
+                chat_id,
+                format!("Роль выдана ✅\nUID: {user_id}\nРоль: {}", role_display(role)),
+            )
+            .await?;
+        }
+        _ => {
+            bot.send_message(chat_id, "Юзер не найден.").await?;
+        }
+    }
+    Ok(())
+}
+
+async fn admin_set_role_text(
+    bot: &Bot,
+    chat_id: ChatId,
+    pool: &PgPool,
+    user_id: i64,
+    text: &str,
+) -> ResponseResult<()> {
+    let role = text.trim().to_lowercase();
+    let ok_len = (1..=32).contains(&role.chars().count());
+    let ok_chars = role.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == ' ');
+    if !ok_len || !ok_chars {
+        bot.send_message(chat_id, "Роль: 1–32 символа (буквы, цифры, _, -, пробел). Еще раз:")
+            .reply_markup(cancel_keyboard())
+            .await?;
+        return Ok(());
+    }
+    // Поток уже снят в on_message; просто пишем роль.
+    match sqlx::query("UPDATE users SET role = $1 WHERE id = $2")
+        .bind(&role)
+        .bind(user_id)
+        .execute(pool)
+        .await
+    {
+        Ok(r) if r.rows_affected() > 0 => {
+            bot.send_message(chat_id, format!("Роль выдана ✅\nUID: {user_id}\nРоль: {role}"))
+                .await?;
+        }
+        _ => {
+            bot.send_message(chat_id, "Юзер не найден.").await?;
+        }
+    }
+    Ok(())
+}
+
+async fn admin_new_custom(
+    bot: &Bot,
+    chat_id: ChatId,
+    pool: &PgPool,
+    tg_id: i64,
+    uses: i32,
+    text: &str,
+) -> ResponseResult<()> {
+    let hours: i32 = match text.trim().parse() {
+        Ok(h) if (1..=8760).contains(&h) => h,
+        _ => {
+            bot.send_message(chat_id, "Нужно число часов от 1 до 8760. Еще раз:")
+                .reply_markup(cancel_keyboard())
+                .await?;
+            return Ok(());
+        }
+    };
+    // Поток уже снят; создаем ключ напрямую.
+    create_key(bot, chat_id, pool, tg_id, "custom", uses, Some(hours)).await
+}
+
+async fn admin_grant_custom(
+    bot: &Bot,
+    chat_id: ChatId,
+    pool: &PgPool,
+    user_id: i64,
+    text: &str,
+) -> ResponseResult<()> {
+    let hours: i64 = match text.trim().parse() {
+        Ok(h) if (1..=8760).contains(&h) => h,
+        _ => {
+            bot.send_message(chat_id, "Нужно число часов от 1 до 8760. Еще раз:")
+                .reply_markup(cancel_keyboard())
+                .await?;
+            return Ok(());
+        }
+    };
+    match grant_sub(pool, user_id, "custom", Some(hours)).await {
+        Ok(desc) => {
+            bot.send_message(chat_id, format!("Подписка выдана ✅\nUID: {user_id}\nТариф: {desc}"))
+                .await?;
+        }
+        Err(e) => {
+            log::error!("grant failed: {e}");
+            bot.send_message(chat_id, "Временная ошибка, попробуйте позже.").await?;
         }
     }
     Ok(())
