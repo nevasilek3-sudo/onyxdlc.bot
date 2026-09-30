@@ -11,8 +11,8 @@
 
 :root {
     --transition: all 0.3s ease-in-out;
-    --accent-color: #ff5f8f;
-    --accent-color-mixed: #b64a6e;
+    --accent-color: rgba(149, 177, 248, 1);
+    --accent-color-mixed: #6b7fb2;
     --text-color: white;
     --text-color-grayed: #ffffff7a;
     --text-color-grayed-24: #ffffff3d;
@@ -33,7 +33,7 @@
 }
 
 *::selection {
-    background-color: rgba(255, 95, 143, 0.4);
+    background-color: rgba(149, 177, 248, 0.4);
     color: var(--text-color);
 }
 
@@ -349,7 +349,7 @@ button:disabled {
     stroke-dashoffset: 326.7;
     transform: rotate(-90deg);
     transform-origin: center;
-    transition: stroke-dashoffset 0.25s ease, stroke 0.4s ease;
+    transition: stroke 0.4s ease;
 }
 
 .ring-fg.done {

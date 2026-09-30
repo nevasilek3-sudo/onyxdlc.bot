@@ -89,10 +89,30 @@
         });
     }
 
-    function setRing(p, status) {
+    function drawRing(p) {
         ring.style.strokeDashoffset = (CIRC - (CIRC * p) / 100).toFixed(1);
-        pct.textContent = p + "%";
+        pct.textContent = Math.round(p) + "%";
+    }
+
+    var shownPct = 0, targetPct = 0, rafId = null;
+
+    function tweenRing() {
+        rafId = null;
+        var d = targetPct - shownPct;
+        if (Math.abs(d) < 0.05) {
+            shownPct = targetPct;
+            drawRing(shownPct);
+            return;
+        }
+        shownPct += d * 0.12;
+        drawRing(shownPct);
+        rafId = requestAnimationFrame(tweenRing);
+    }
+
+    function setRing(p, status) {
+        targetPct = Math.max(0, Math.min(100, p));
         if (typeof status === "string") injStatus.textContent = status;
+        if (rafId === null) rafId = requestAnimationFrame(tweenRing);
     }
 
     function resetInject() {
@@ -101,6 +121,9 @@
         check.classList.remove("show");
         cross.classList.remove("show");
         pct.style.opacity = "1";
+        if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; }
+        shownPct = 0;
+        targetPct = 0;
         setRing(0, "Подготовка...");
     }
 
@@ -122,6 +145,10 @@
     }
 
     function finishInject(ok, errText) {
+        if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; }
+        shownPct = ok ? 100 : targetPct;
+        targetPct = shownPct;
+        drawRing(shownPct);
         pct.style.opacity = "0";
         if (ok) {
             ring.classList.add("done");
@@ -205,12 +232,12 @@
         send({ action: "CLOSE" });
     });
 
-    // Таскание окна за верхнюю полосу (кроме кнопок и полей ввода).
+    // Таскание окна за верхнюю часть (заголовок), кроме кнопок и полей ввода.
     document.addEventListener("mousedown", function (e) {
         if (!hasBridge) return;
         var t = e.target;
         var tag = t && t.tagName ? t.tagName : "";
-        if (e.clientY <= 34 && e.clientX <= window.innerWidth - 70 &&
+        if (e.clientY <= 84 && e.clientX <= window.innerWidth - 70 &&
             tag !== "INPUT" && tag !== "BUTTON") {
             send({ action: "DRAG" });
         }
