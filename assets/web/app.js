@@ -205,6 +205,17 @@
         send({ action: "CLOSE" });
     });
 
+    // Таскание окна за верхнюю полосу (кроме кнопок и полей ввода).
+    document.addEventListener("mousedown", function (e) {
+        if (!hasBridge) return;
+        var t = e.target;
+        var tag = t && t.tagName ? t.tagName : "";
+        if (e.clientY <= 34 && e.clientX <= window.innerWidth - 70 &&
+            tag !== "INPUT" && tag !== "BUTTON") {
+            send({ action: "DRAG" });
+        }
+    });
+
     form.addEventListener("submit", function (e) {
         e.preventDefault();
         var u = userEl.value.trim();
