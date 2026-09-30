@@ -24,6 +24,11 @@
     var CIRC = 326.7;
     var hasBridge = !!(window.chrome && chrome.webview && chrome.webview.postMessage);
     var selectedPid = null;
+    var loginTimer = null;
+
+    function clearLoginTimer() {
+        if (loginTimer) { clearTimeout(loginTimer); loginTimer = null; }
+    }
 
     function setStatus(t) { statusEl.textContent = t; }
 
@@ -163,6 +168,7 @@
         chrome.webview.addEventListener("message", function (e) {
             var m = e.data || {};
             if (m.action === "LOGIN_RESULT") {
+                clearLoginTimer();
                 if (m.ok) {
                     switchTo(home, function () { send({ action: "GET_PROCESSES" }); });
                 } else {
@@ -213,6 +219,13 @@
         btn.disabled = true;
         setStatus("Authorizing...");
         send({ action: "LOGIN", user: u, pass: p });
+        // Сторожевой таймер: натив обязан ответить за 25с.
+        clearLoginTimer();
+        loginTimer = setTimeout(function () {
+            loginTimer = null;
+            btn.disabled = false;
+            setStatus("Server timeout, try again");
+        }, 25000);
     });
 
     injectBtn.addEventListener("click", function () {

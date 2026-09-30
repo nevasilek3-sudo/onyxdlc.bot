@@ -1,10 +1,12 @@
 @font-face {
     font-family: SFBold;
     src: url(fonts/sf-bold.ttf);
+    font-display: block;
 }
 @font-face {
     font-family: SFRegular;
     src: url(fonts/sf-regular.ttf);
+    font-display: block;
 }
 
 :root {
@@ -176,6 +178,12 @@ html, body {
 
 .input-container input::placeholder {
     color: var(--text-color-grayed-24);
+}
+
+/* Убираем нативный глаз Edge/WebView2 — свой уже есть. */
+.input-container input::-ms-reveal,
+.input-container input::-ms-clear {
+    display: none;
 }
 
 .input-container input:focus {
