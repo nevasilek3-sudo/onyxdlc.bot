@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=250, height=300">
+<title>onyx loader</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="win">
+  <div class="window-controls">
+    <span id="minBtn" class="win-btn">&#8212;</span>
+    <span id="closeBtn" class="win-btn">&#10005;</span>
+  </div>
+  <div class="auth-title" id="authTitle">
+    <div class="client-name">Onyx</div>
+    <div class="welcome">Welcome back!</div>
+  </div>
+  <form id="authForm" method="post" autocomplete="off">
+    <div class="auth-form">
+      <div class="form-input">
+        <label for="username">Username</label>
+        <div class="input-container">
+          <svg class="input-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+          <input id="username" name="username" type="text" placeholder="Enter your Name">
+        </div>
+      </div>
+      <div class="form-input">
+        <label for="password">Password</label>
+        <div class="input-container">
+          <svg class="input-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          <input id="password" name="password" type="password" placeholder="Enter your Password">
+          <svg id="eye" class="input-eye" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+        </div>
+      </div>
+    </div>
+    <div class="form-buttons">
+      <div id="status"></div>
+      <button id="signIn" type="submit" class="btn-fill">Sign In</button>
+    </div>
+  </form>
+  <div id="home" style="display:none">
+    <div id="procList"></div>
+    <div class="form-buttons">
+      <div id="homeStatus"></div>
+      <button id="injectBtn" type="button" class="btn-fill">Inject</button>
+    </div>
+  </div>
+  <div id="injecting" style="display:none">
+    <div class="ring-wrap">
+      <svg width="120" height="120" viewBox="0 0 120 120">
+        <circle class="ring-bg" cx="60" cy="60" r="52" />
+        <circle id="ringFg" class="ring-fg" cx="60" cy="60" r="52" />
+        <path id="checkMark" class="check" d="M42 61 L55 74 L80 45" />
+        <path id="crossMark" class="cross" d="M45 45 L75 75 M75 45 L45 75" />
+      </svg>
+      <div id="pct">0%</div>
+    </div>
+    <div id="injectStatus">Подготовка...</div>
+  </div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

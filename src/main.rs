@@ -183,12 +183,49 @@ async fn run_health_server(port: u16, state: ApiState) {
         .route("/api/profile", post(api_profile))
         .route("/api/dll", get(api_dll))
         .route("/api/dll/info", get(api_dll_info))
+        .route("/loader/", get(loader_page))
+        .route("/loader/app.css", get(loader_css))
+        .route("/loader/app.js", get(loader_js))
+        .route("/loader/fonts/sf-regular.ttf", get(loader_font_regular))
+        .route("/loader/fonts/sf-bold.ttf", get(loader_font_bold))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{port}");
     log::info!("Health server on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+async fn loader_page() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("../assets/web/index.html"))
+}
+
+async fn loader_css() -> impl axum::response::IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/css")],
+        include_str!("../assets/web/app.css"),
+    )
+}
+
+async fn loader_js() -> impl axum::response::IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/javascript")],
+        include_str!("../assets/web/app.js"),
+    )
+}
+
+async fn loader_font_regular() -> impl axum::response::IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "font/ttf")],
+        include_bytes!("../assets/web/fonts/sf-regular.ttf").to_vec(),
+    )
+}
+
+async fn loader_font_bold() -> impl axum::response::IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "font/ttf")],
+        include_bytes!("../assets/web/fonts/sf-bold.ttf").to_vec(),
+    )
 }
 
 // ---------- сообщения ----------
