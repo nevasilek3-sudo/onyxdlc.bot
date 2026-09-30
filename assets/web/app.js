@@ -1,71 +1,76 @@
-// Фронт лоадера. Привязка к нативу (WebView2 hostObjects.pyro) — следующим шагом.
+// Фронт лоадера.
+// В WebView2 лоадера говорит с нативом через chrome.webview.postMessage.
+// В обычном браузере моста нет — работают вшитые стабы для предпросмотра.
 (function () {
     var form = document.getElementById("authForm");
+    var title = document.getElementById("authTitle");
     var userEl = document.getElementById("username");
     var passEl = document.getElementById("password");
     var eye = document.getElementById("eye");
     var statusEl = document.getElementById("status");
     var btn = document.getElementById("signIn");
-
-    function setStatus(t) {
-        statusEl.textContent = t;
-    }
-
-    var bridge = null;
-    try {
-        if (window.chrome && chrome.webview && chrome.webview.hostObjects) {
-            bridge = chrome.webview.hostObjects.pyro;
-        }
-    } catch (e) {
-        bridge = null;
-    }
-
-    // Сообщения от натива: window.postMessage({status: "..."})
-    window.addEventListener("message", function (e) {
-        if (e.data && typeof e.data.status === "string") {
-            setStatus(e.data.status);
-        }
-    });
-
-    eye.addEventListener("click", function () {
-        passEl.type = passEl.type === "password" ? "text" : "password";
-    });
-
-    // Кнопки окна. Натив подключим в конце.
-    document.getElementById("minBtn").addEventListener("click", function () {
-        try { if (bridge && bridge.Minimize) bridge.Minimize(); } catch (e) {}
-    });
-    document.getElementById("closeBtn").addEventListener("click", function () {
-        try { if (bridge && bridge.Close) bridge.Close(); } catch (e) {}
-    });
-
-    // ЗАГЛУШКА: список процессов, натив подключим в конце.
-    // Натив будет отдавать exe + pid + title (заголовок окна).
-    var procs = [
-        { exe: "javaw.exe", pid: 1234, title: "Minecraft* 26.3" },
-        { exe: "javaw.exe", pid: 5678, title: "" },
-        { exe: "minecraft.exe", pid: 9012, title: "Minecraft Launcher" }
-    ];
-
-    // Дружелюбное имя: без .exe.
-    function friendlyName(p) {
-        return p.exe.replace(/\.exe$/i, "");
-    }
-    var selectedPid = null;
+    var home = document.getElementById("home");
     var procList = document.getElementById("procList");
     var homeStatus = document.getElementById("homeStatus");
+    var injectBtn = document.getElementById("injectBtn");
+    var ing = document.getElementById("injecting");
+    var ring = document.getElementById("ringFg");
+    var pct = document.getElementById("pct");
+    var injStatus = document.getElementById("injectStatus");
+    var check = document.getElementById("checkMark");
+    var cross = document.getElementById("crossMark");
+    var controls = document.querySelector(".window-controls");
 
-    function renderProcs() {
+    var CIRC = 326.7;
+    var hasBridge = !!(window.chrome && chrome.webview && chrome.webview.postMessage);
+    var selectedPid = null;
+
+    function setStatus(t) { statusEl.textContent = t; }
+
+    function send(o) {
+        if (hasBridge) {
+            try { chrome.webview.postMessage(o); } catch (e) {}
+        }
+    }
+
+    function switchTo(el, after) {
+        title.classList.add("view-out");
+        form.classList.add("view-out");
+        setTimeout(function () {
+            form.style.display = "none";
+            title.style.display = "none";
+            el.classList.add("view-in-start");
+            el.style.display = "flex";
+            requestAnimationFrame(function () {
+                requestAnimationFrame(function () {
+                    el.classList.remove("view-in-start");
+                });
+            });
+            if (after) after();
+        }, 280);
+    }
+
+    function friendlyName(exe) {
+        return (exe || "").replace(/\.exe$/i, "");
+    }
+
+    function renderProcs(items) {
         procList.innerHTML = "";
         selectedPid = null;
-        procs.forEach(function (p) {
+        homeStatus.textContent = "";
+        if (!items || !items.length) {
+            homeStatus.textContent = "No processes found. Start Minecraft...";
+            return;
+        }
+        items.forEach(function (p) {
             var row = document.createElement("div");
             row.className = "proc-row";
             var n = document.createElement("span");
-            n.textContent = friendlyName(p);
+            n.textContent = friendlyName(p.exe);
             var id = document.createElement("span");
             id.className = "pid";
             id.textContent = p.pid;
+            if (p.title) row.title = p.title;
             row.appendChild(n);
             row.appendChild(id);
             row.addEventListener("click", function () {
@@ -79,75 +84,118 @@
         });
     }
 
-    document.getElementById("injectBtn").addEventListener("click", function () {
-        if (!selectedPid) {
-            homeStatus.textContent = "Select a process first";
-            return;
-        }
-        // ЗАГЛУШКА: инжект подключим в конце. Пока — staged-прогресс.
-        var home = document.getElementById("home");
-        var controls = document.querySelector(".window-controls");
-        home.classList.add("view-out");
-        setTimeout(function () {
-            home.style.display = "none";
-            home.classList.remove("view-out");
-            controls.style.display = "none";
-            var ing = document.getElementById("injecting");
-            ing.classList.add("view-in-start");
-            ing.style.display = "flex";
-            requestAnimationFrame(function () {
-                requestAnimationFrame(function () {
-                    ing.classList.remove("view-in-start");
-                });
-            });
-            runStubInject();
-        }, 280);
-    });
+    function setRing(p, status) {
+        ring.style.strokeDashoffset = (CIRC - (CIRC * p) / 100).toFixed(1);
+        pct.textContent = p + "%";
+        if (typeof status === "string") injStatus.textContent = status;
+    }
 
-    var CIRC = 326.7;
-    function runStubInject() {
-        var ring = document.getElementById("ringFg");
-        var pct = document.getElementById("pct");
-        var st = document.getElementById("injectStatus");
-        var check = document.getElementById("checkMark");
-        var cross = document.getElementById("crossMark");
+    function resetInject() {
         ring.classList.remove("done");
         ring.classList.remove("fail");
         check.classList.remove("show");
         cross.classList.remove("show");
         pct.style.opacity = "1";
-        // СТАБ: процесс 5678 всегда "фейлится", чтобы посмотреть оба исхода.
+        setRing(0, "Подготовка...");
+    }
+
+    function goInjecting() {
+        home.classList.add("view-out");
+        setTimeout(function () {
+            home.style.display = "none";
+            home.classList.remove("view-out");
+            controls.style.display = "none";
+            ing.classList.add("view-in-start");
+            ing.style.display = "flex";
+            resetInject();
+            requestAnimationFrame(function () {
+                requestAnimationFrame(function () {
+                    ing.classList.remove("view-in-start");
+                });
+            });
+        }, 280);
+    }
+
+    function finishInject(ok, errText) {
+        pct.style.opacity = "0";
+        if (ok) {
+            ring.classList.add("done");
+            check.classList.add("show");
+            injStatus.textContent = "Injection completed successfully!";
+        } else {
+            ring.classList.add("fail");
+            cross.classList.add("show");
+            injStatus.textContent = errText || "Injection failed";
+        }
+    }
+
+    // ---- стабы для обычного браузера ----
+    var stubProcs = [
+        { exe: "javaw.exe", pid: 1234, title: "Minecraft* 26.3" },
+        { exe: "javaw.exe", pid: 5678, title: "" },
+        { exe: "minecraft.exe", pid: 9012, title: "Minecraft Launcher" }
+    ];
+
+    function stubInject() {
         var willFail = (selectedPid === 5678);
         var p = 0;
         function stage() {
-            if (p < 30) st.textContent = "Acquiring client payload...";
-            else if (p < 60) st.textContent = "Downloading DLL from backend...";
-            else if (p < 100) st.textContent = "Performing Manual Map injection...";
+            if (p < 30) return "Acquiring client payload...";
+            if (p < 60) return "Downloading DLL from backend...";
+            if (p < 100) return "Performing Manual Map injection...";
+            return "";
         }
-        stage();
+        setRing(0, stage());
         var t = setInterval(function () {
             p += 2;
             if (p >= 100) {
-                p = 100;
                 clearInterval(t);
-                pct.style.opacity = "0";
-                if (willFail) {
-                    st.textContent = "Injection failed";
-                    ring.classList.add("fail");
-                    cross.classList.add("show");
-                } else {
-                    st.textContent = "Injection completed successfully!";
-                    ring.classList.add("done");
-                    check.classList.add("show");
-                }
-                // Кнопки окна после инжекта не возвращаем.
+                setRing(100);
+                finishInject(!willFail, "Injection failed");
             } else {
-                stage();
+                setRing(p, stage());
             }
-            ring.style.strokeDashoffset = (CIRC - (CIRC * p) / 100).toFixed(1);
-            pct.textContent = p + "%";
         }, 50);
     }
+    // ---- конец стабов ----
+
+    if (hasBridge) {
+        chrome.webview.addEventListener("message", function (e) {
+            var m = e.data || {};
+            if (m.action === "LOGIN_RESULT") {
+                if (m.ok) {
+                    switchTo(home, function () { send({ action: "GET_PROCESSES" }); });
+                } else {
+                    btn.disabled = false;
+                    setStatus(m.error || "Login failed");
+                }
+            } else if (m.action === "PROCESSES") {
+                renderProcs(m.items);
+            } else if (m.action === "INJECT_PROGRESS") {
+                setRing(m.pct || 0, m.status);
+            } else if (m.action === "INJECT_DONE") {
+                finishInject(!!m.ok, m.error);
+            }
+        });
+    }
+
+    // Сообщения от натива старым путем (совместимость).
+    window.addEventListener("message", function (e) {
+        if (e.data && typeof e.data.status === "string" && !hasBridge) {
+            setStatus(e.data.status);
+        }
+    });
+
+    eye.addEventListener("click", function () {
+        passEl.type = passEl.type === "password" ? "text" : "password";
+    });
+
+    document.getElementById("minBtn").addEventListener("click", function () {
+        send({ action: "MINIMIZE" });
+    });
+    document.getElementById("closeBtn").addEventListener("click", function () {
+        send({ action: "CLOSE" });
+    });
 
     form.addEventListener("submit", function (e) {
         e.preventDefault();
@@ -157,24 +205,27 @@
             setStatus("Enter username and password");
             return;
         }
-        // ЗАГЛУШКА: пускаем с любым логином/паролем, натив подключим в конце.
-        // Переход: старое уезжает влево, новое приезжает справа.
-        var title = document.getElementById("authTitle");
-        title.classList.add("view-out");
-        form.classList.add("view-out");
-        setTimeout(function () {
-            form.style.display = "none";
-            title.style.display = "none";
-            var home = document.getElementById("home");
-            home.classList.add("view-in-start");
-            home.style.display = "flex";
-            renderProcs();
-            requestAnimationFrame(function () {
-                requestAnimationFrame(function () {
-                    home.classList.remove("view-in-start");
-                });
-            });
-        }, 280);
+        if (!hasBridge) {
+            // СТАБ предпросмотра: пускаем с любым логином/паролем.
+            switchTo(home, function () { renderProcs(stubProcs); });
+            return;
+        }
+        btn.disabled = true;
+        setStatus("Authorizing...");
+        send({ action: "LOGIN", user: u, pass: p });
+    });
+
+    injectBtn.addEventListener("click", function () {
+        if (!selectedPid) {
+            homeStatus.textContent = "Select a process first";
+            return;
+        }
+        goInjecting();
+        if (hasBridge) {
+            send({ action: "INJECT", pid: selectedPid });
+        } else {
+            setTimeout(stubInject, 300);
+        }
     });
 
     window.onyxSetStatus = setStatus;
