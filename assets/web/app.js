@@ -181,6 +181,8 @@
                 setRing(m.pct || 0, m.status);
             } else if (m.action === "INJECT_DONE") {
                 finishInject(!!m.ok, m.error);
+            } else if (m.action === "STATUS") {
+                setStatus(m.text || "");
             }
         });
     }
