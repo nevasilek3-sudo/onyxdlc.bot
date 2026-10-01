@@ -183,6 +183,16 @@ async fn run_health_server(port: u16, state: ApiState) {
         .route("/api/profile", post(api_profile))
         .route("/api/dll", get(api_dll))
         .route("/api/dll/info", get(api_dll_info))
+        .route("/api/cloud/list", post(api_cloud_list))
+        .route("/api/cloud/save", post(api_cloud_save))
+        .route("/api/cloud/load", post(api_cloud_load))
+        .route("/api/cloud/delete", post(api_cloud_delete))
+        .route("/api/cloud/visibility", post(api_cloud_visibility))
+        .route("/api/cloud/import", post(api_cloud_import))
+        .route("/api/cloud/gallery", post(api_cloud_gallery))
+        .route("/api/cloud/friends/list", post(api_friends_list))
+        .route("/api/cloud/friends/add", post(api_friends_add))
+        .route("/api/cloud/friends/remove", post(api_friends_remove))
         .route("/loader/", get(loader_page))
         .route("/loader/app.css", get(loader_css))
         .route("/loader/app.js", get(loader_js))
@@ -2348,6 +2358,473 @@ struct DllInfoResp {
     ok: bool,
     sha256: Option<String>,
     version: Option<i32>,
+}
+
+#[derive(serde::Serialize)]
+struct DllInfoResp {
+    ok: bool,
+    sha256: Option<String>,
+    version: Option<i32>,
+}
+
+// ---------- облако: конфиги и темы ----------
+
+fn cloud_table(kind: &str) -> Option<&'static str> {
+    match kind {
+        "config" => Some("cloud_configs"),
+        "theme" => Some("cloud_themes"),
+        _ => None,
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CloudListReq {
+    token: String,
+    hwid: String,
+    kind: String,
+}
+
+#[derive(serde::Serialize)]
+struct CloudItem {
+    name: String,
+    share_key: String,
+    is_public: bool,
+    updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(serde::Serialize)]
+struct CloudListResp {
+    ok: bool,
+    error: String,
+    items: Vec<CloudItem>,
+}
+
+#[derive(serde::Deserialize)]
+struct CloudSaveReq {
+    token: String,
+    hwid: String,
+    kind: String,
+    name: String,
+    data: serde_json::Value,
+}
+
+#[derive(serde::Serialize)]
+struct CloudSaveResp {
+    ok: bool,
+    error: String,
+    share_key: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct CloudNameReq {
+    token: String,
+    hwid: String,
+    kind: String,
+    name: String,
+}
+
+#[derive(serde::Serialize)]
+struct CloudLoadResp {
+    ok: bool,
+    error: String,
+    data: Option<serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct CloudVisReq {
+    token: String,
+    hwid: String,
+    kind: String,
+    name: String,
+    is_public: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct CloudImportReq {
+    token: String,
+    hwid: String,
+    kind: String,
+    key: String,
+}
+
+#[derive(serde::Serialize)]
+struct CloudGalleryItem {
+    name: String,
+    owner: String,
+    share_key: String,
+    updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(serde::Serialize)]
+struct CloudGalleryResp {
+    ok: bool,
+    error: String,
+    items: Vec<CloudGalleryItem>,
+}
+
+#[derive(serde::Serialize)]
+struct CloudOkResp {
+    ok: bool,
+    error: String,
+}
+
+fn cloud_ok(ok: bool, err: &str) -> (axum::http::StatusCode, axum::Json<CloudOkResp>) {
+    (
+        if ok { axum::http::StatusCode::OK } else { axum::http::StatusCode::BAD_REQUEST },
+        axum::Json(CloudOkResp { ok, error: err.to_string() }),
+    )
+}
+
+fn valid_cloud_name(name: &str) -> bool {
+    let t = name.trim();
+    (1..=32).contains(&t.chars().count())
+        && t.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == ' ')
+}
+
+async fn api_cloud_list(
+    axum::extract::State(s): axum::extract::State<ApiState>,
+    axum::Json(req): axum::Json<CloudListReq>,
+) -> impl axum::response::IntoResponse {
+    use axum::http::StatusCode;
+    let table = match cloud_table(req.kind.trim()) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(CloudListResp { ok: false, error: "bad kind".to_string(), items: vec![] }),
+            )
+        }
+    };
+    let uid = match check_session(&s.pool, &req.token, &req.hwid).await {
+        Some(u) => u,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(CloudListResp { ok: false, error: "invalid session".to_string(), items: vec![] }),
+            )
+        }
+    };
+    let q = format!("SELECT name, share_key, is_public, updated_at FROM {table} WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 50");
+    let rows: Vec<(String, String, bool, Option<DateTime<Utc>>)> =
+        sqlx::query_as::<_, (String, String, bool, Option<DateTime<Utc>>)>(&q)
+            .bind(uid)
+            .fetch_all(&s.pool)
+            .await
+            .unwrap_or_default();
+    let items = rows
+        .into_iter()
+        .map(|(name, share_key, is_public, updated_at)| CloudItem { name, share_key, is_public, updated_at })
+        .collect();
+    (StatusCode::OK, axum::Json(CloudListResp { ok: true, error: String::new(), items }))
+}
+
+async fn api_cloud_save(
+    axum::extract::State(s): axum::extract::State<ApiState>,
+    axum::Json(req): axum::Json<CloudSaveReq>,
+) -> impl axum::response::IntoResponse {
+    use axum::http::StatusCode;
+    let table = match cloud_table(req.kind.trim()) {
+        Some(t) => t,
+        None => return (StatusCode::BAD_REQUEST, axum::Json(CloudSaveResp { ok: false, error: "bad kind".to_string(), share_key: None })),
+    };
+    let uid = match check_session(&s.pool, &req.token, &req.hwid).await {
+        Some(u) => u,
+        None => return (StatusCode::UNAUTHORIZED, axum::Json(CloudSaveResp { ok: false, error: "invalid session".to_string(), share_key: None })),
+    };
+    let name = req.name.trim().to_string();
+    if !valid_cloud_name(&name) {
+        return (StatusCode::BAD_REQUEST, axum::Json(CloudSaveResp { ok: false, error: "bad name".to_string(), share_key: None }));
+    }
+    let data_str = req.data.to_string();
+    if (data_str.len() > 262144) {
+        return (StatusCode::PAYLOAD_TOO_LARGE, axum::Json(CloudSaveResp { ok: false, error: "too big".to_string(), share_key: None }));
+    }
+    let key = gen_key_code();
+    let q = format!(
+        "INSERT INTO {table} (user_id, name, data, share_key, updated_at)
+         VALUES ($1, $2, $3, $4, now())
+         ON CONFLICT (user_id, name) DO UPDATE SET data = EXCLUDED.data, updated_at = now()
+         RETURNING share_key"
+    );
+    let row: Result<Option<(String,)>, sqlx::Error> = sqlx::query_as(&q)
+        .bind(uid)
+        .bind(&name)
+        .bind(&req.data)
+        .bind(&key)
+        .fetch_optional(&s.pool)
+        .await;
+    match row {
+        Ok(Some((share_key,))) => (StatusCode::OK, axum::Json(CloudSaveResp { ok: true, error: String::new(), share_key: Some(share_key) })),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(CloudSaveResp { ok: false, error: "temporary error".to_string(), share_key: None })),
+    }
+}
+
+async fn api_cloud_load(
+    axum::extract::State(s): axum::extract::State<ApiState>,
+    axum::Json(req): axum::Json<CloudNameReq>,
+) -> impl axum::response::IntoResponse {
+    use axum::http::StatusCode;
+    let table = match cloud_table(req.kind.trim()) {
+        Some(t) => t,
+        None => return (StatusCode::BAD_REQUEST, axum::Json(CloudLoadResp { ok: false, error: "bad kind".to_string(), data: None })),
+    };
+    let uid = match check_session(&s.pool, &req.token, &req.hwid).await {
+        Some(u) => u,
+        None => return (StatusCode::UNAUTHORIZED, axum::Json(CloudLoadResp { ok: false, error: "invalid session".to_string(), data: None })),
+    };
+    let q = format!("SELECT data FROM {table} WHERE user_id = $1 AND name = $2");
+    let row: Option<(serde_json::Value,)> = sqlx::query_as::<_, (serde_json::Value,)>(&q)
+        .bind(uid)
+        .bind(req.name.trim())
+        .fetch_optional(&s.pool)
+        .await
+        .unwrap_or(None);
+    match row {
+        Some((data,)) => (StatusCode::OK, axum::Json(CloudLoadResp { ok: true, error: String::new(), data: Some(data) })),
+        None => (StatusCode::NOT_FOUND, axum::Json(CloudLoadResp { ok: false, error: "not found".to_string(), data: None })),
+    }
+}
+
+async fn api_cloud_delete(
+    axum::extract::State(s): axum::extract::State<ApiState>,
+    axum::Json(req): axum::Json<CloudNameReq>,
+) -> impl axum::response::IntoResponse {
+    let table = match cloud_table(req.kind.trim()) {
+        Some(t) => t,
+        None => return cloud_ok(false, "bad kind"),
+    };
+    let uid = match check_session(&s.pool, &req.token, &req.hwid).await {
+        Some(u) => u,
+        None => return cloud_ok(false, "invalid session"),
+    };
+    let q = format!("DELETE FROM {table} WHERE user_id = $1 AND name = $2");
+    match sqlx::query(&q).bind(uid).bind(req.name.trim()).execute(&s.pool).await {
+        Ok(r) if r.rows_affected() > 0 => cloud_ok(true, ""),
+        Ok(_) => cloud_ok(false, "not found"),
+        Err(_) => cloud_ok(false, "temporary error"),
+    }
+}
+
+async fn api_cloud_visibility(
+    axum::extract::State(s): axum::extract::State<ApiState>,
+    axum::Json(req): axum::Json<CloudVisReq>,
+) -> impl axum::response::IntoResponse {
+    let table = match cloud_table(req.kind.trim()) {
+        Some(t) => t,
+        None => return cloud_ok(false, "bad kind"),
+    };
+    let uid = match check_session(&s.pool, &req.token, &req.hwid).await {
+        Some(u) => u,
+        None => return cloud_ok(false, "invalid session"),
+    };
+    let q = format!("UPDATE {table} SET is_public = $1, updated_at = now() WHERE user_id = $2 AND name = $3");
+    match sqlx::query(&q).bind(req.is_public).bind(uid).bind(req.name.trim()).execute(&s.pool).await {
+        Ok(r) if r.rows_affected() > 0 => cloud_ok(true, ""),
+        Ok(_) => cloud_ok(false, "not found"),
+        Err(_) => cloud_ok(false, "temporary error"),
+    }
+}
+
+async fn api_cloud_import(
+    axum::extract::State(s): axum::extract::State<ApiState>,
+    axum::Json(req): axum::Json<CloudImportReq>,
+) -> impl axum::response::IntoResponse {
+    use axum::http::StatusCode;
+    let table = match cloud_table(req.kind.trim()) {
+        Some(t) => t,
+        None => return (StatusCode::BAD_REQUEST, axum::Json(CloudSaveResp { ok: false, error: "bad kind".to_string(), share_key: None })),
+    };
+    let uid = match check_session(&s.pool, &req.token, &req.hwid).await {
+        Some(u) => u,
+        None => return (StatusCode::UNAUTHORIZED, axum::Json(CloudSaveResp { ok: false, error: "invalid session".to_string(), share_key: None })),
+    };
+    let key = req.key.trim().to_uppercase();
+    let q = format!("SELECT user_id, name, data, is_public FROM {table} WHERE share_key = $1");
+    let row: Option<(i64, String, serde_json::Value, bool)> =
+        sqlx::query_as::<_, (i64, String, serde_json::Value, bool)>(&q)
+            .bind(&key)
+            .fetch_optional(&s.pool)
+            .await
+            .unwrap_or(None);
+    let (owner, name, data, _is_public) = match row {
+        Some(r) => r,
+        None => return (StatusCode::NOT_FOUND, axum::Json(CloudSaveResp { ok: false, error: "not found".to_string(), share_key: None })),
+    };
+    if owner == uid {
+        return (StatusCode::BAD_REQUEST, axum::Json(CloudSaveResp { ok: false, error: "own key".to_string(), share_key: None }));
+    }
+    let new_key = gen_key_code();
+    let qi = format!(
+        "INSERT INTO {table} (user_id, name, data, share_key, is_public, updated_at)
+         VALUES ($1, $2, $3, $4, FALSE, now())
+         ON CONFLICT (user_id, name) DO UPDATE SET data = EXCLUDED.data, updated_at = now()
+         RETURNING share_key"
+    );
+    let ins: Result<Option<(String,)>, sqlx::Error> = sqlx::query_as(&qi)
+        .bind(uid)
+        .bind(&name)
+        .bind(&data)
+        .bind(&new_key)
+        .fetch_optional(&s.pool)
+        .await;
+    match ins {
+        Ok(Some((share_key,))) => (StatusCode::OK, axum::Json(CloudSaveResp { ok: true, error: String::new(), share_key: Some(share_key) })),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(CloudSaveResp { ok: false, error: "temporary error".to_string(), share_key: None })),
+    }
+}
+
+async fn api_cloud_gallery(
+    axum::extract::State(s): axum::extract::State<ApiState>,
+    axum::Json(req): axum::Json<CloudListReq>,
+) -> impl axum::response::IntoResponse {
+    use axum::http::StatusCode;
+    let table = match cloud_table(req.kind.trim()) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(CloudGalleryResp { ok: false, error: "bad kind".to_string(), items: vec![] }),
+            )
+        }
+    };
+    if check_session(&s.pool, &req.token, &req.hwid).await.is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(CloudGalleryResp { ok: false, error: "invalid session".to_string(), items: vec![] }),
+        );
+    }
+    let q = format!(
+        "SELECT t.name, u.username, t.share_key, t.updated_at FROM {table} t
+         JOIN users u ON u.id = t.user_id WHERE t.is_public = TRUE
+         ORDER BY t.updated_at DESC LIMIT 50"
+    );
+    let rows: Vec<(String, String, String, Option<DateTime<Utc>>)> =
+        sqlx::query_as::<_, (String, String, String, Option<DateTime<Utc>>)>(&q)
+            .fetch_all(&s.pool)
+            .await
+            .unwrap_or_default();
+    let items = rows
+        .into_iter()
+        .map(|(name, owner, share_key, updated_at)| CloudGalleryItem { name, owner, share_key, updated_at })
+        .collect();
+    (StatusCode::OK, axum::Json(CloudGalleryResp { ok: true, error: String::new(), items }))
+}
+
+// ---------- облако: друзья ----------
+
+#[derive(serde::Deserialize)]
+struct FriendsAuth {
+    token: String,
+    hwid: String,
+}
+
+#[derive(serde::Serialize)]
+struct FriendItem {
+    nick: String,
+    alias: String,
+}
+
+#[derive(serde::Serialize)]
+struct FriendsListResp {
+    ok: bool,
+    error: String,
+    friends: Vec<FriendItem>,
+}
+
+#[derive(serde::Deserialize)]
+struct FriendsAddReq {
+    token: String,
+    hwid: String,
+    nick: String,
+    alias: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct FriendsRemoveReq {
+    token: String,
+    hwid: String,
+    nick: String,
+}
+
+fn valid_nick(nick: &str) -> bool {
+    let t = nick.trim();
+    (1..=16).contains(&t.chars().count())
+        && t.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+async fn api_friends_list(
+    axum::extract::State(s): axum::extract::State<ApiState>,
+    axum::Json(req): axum::Json<FriendsAuth>,
+) -> impl axum::response::IntoResponse {
+    use axum::http::StatusCode;
+    let uid = match check_session(&s.pool, &req.token, &req.hwid).await {
+        Some(u) => u,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(FriendsListResp { ok: false, error: "invalid session".to_string(), friends: vec![] }),
+            )
+        }
+    };
+    let rows: Vec<(String, String)> =
+        sqlx::query_as::<_, (String, String)>("SELECT nick, alias FROM cloud_friends WHERE user_id = $1 ORDER BY created_at LIMIT 200")
+            .bind(uid)
+            .fetch_all(&s.pool)
+            .await
+            .unwrap_or_default();
+    let friends = rows.into_iter().map(|(nick, alias)| FriendItem { nick, alias }).collect();
+    (StatusCode::OK, axum::Json(FriendsListResp { ok: true, error: String::new(), friends }))
+}
+
+async fn api_friends_add(
+    axum::extract::State(s): axum::extract::State<ApiState>,
+    axum::Json(req): axum::Json<FriendsAddReq>,
+) -> impl axum::response::IntoResponse {
+    let uid = match check_session(&s.pool, &req.token, &req.hwid).await {
+        Some(u) => u,
+        None => return cloud_ok(false, "invalid session"),
+    };
+    let nick = req.nick.trim().to_string();
+    if !valid_nick(&nick) {
+        return cloud_ok(false, "bad nick");
+    }
+    let alias = req.alias.as_deref().unwrap_or("").trim().to_string();
+    if alias.chars().count() > 32 {
+        return cloud_ok(false, "bad alias");
+    }
+    let r = sqlx::query(
+        "INSERT INTO cloud_friends (user_id, nick, alias) VALUES ($1, $2, $3)
+         ON CONFLICT (user_id, nick) DO UPDATE SET alias = EXCLUDED.alias",
+    )
+    .bind(uid)
+    .bind(&nick)
+    .bind(&alias)
+    .execute(&s.pool)
+    .await;
+    match r {
+        Ok(_) => cloud_ok(true, ""),
+        Err(_) => cloud_ok(false, "temporary error"),
+    }
+}
+
+async fn api_friends_remove(
+    axum::extract::State(s): axum::extract::State<ApiState>,
+    axum::Json(req): axum::Json<FriendsRemoveReq>,
+) -> impl axum::response::IntoResponse {
+    let uid = match check_session(&s.pool, &req.token, &req.hwid).await {
+        Some(u) => u,
+        None => return cloud_ok(false, "invalid session"),
+    };
+    match sqlx::query("DELETE FROM cloud_friends WHERE user_id = $1 AND lower(nick) = lower($2)")
+        .bind(uid)
+        .bind(req.nick.trim())
+        .execute(&s.pool)
+        .await
+    {
+        Ok(r) if r.rows_affected() > 0 => cloud_ok(true, ""),
+        Ok(_) => cloud_ok(false, "not found"),
+        Err(_) => cloud_ok(false, "temporary error"),
+    }
 }
 
 async fn api_dll_info(
