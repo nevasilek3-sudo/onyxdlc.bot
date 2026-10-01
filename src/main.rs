@@ -2360,13 +2360,6 @@ struct DllInfoResp {
     version: Option<i32>,
 }
 
-#[derive(serde::Serialize)]
-struct DllInfoResp {
-    ok: bool,
-    sha256: Option<String>,
-    version: Option<i32>,
-}
-
 // ---------- облако: конфиги и темы ----------
 
 fn cloud_table(kind: &str) -> Option<&'static str> {
@@ -2536,7 +2529,7 @@ async fn api_cloud_save(
         return (StatusCode::BAD_REQUEST, axum::Json(CloudSaveResp { ok: false, error: "bad name".to_string(), share_key: None }));
     }
     let data_str = req.data.to_string();
-    if (data_str.len() > 262144) {
+    if data_str.len() > 262144 {
         return (StatusCode::PAYLOAD_TOO_LARGE, axum::Json(CloudSaveResp { ok: false, error: "too big".to_string(), share_key: None }));
     }
     let key = gen_key_code();
