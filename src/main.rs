@@ -21,6 +21,7 @@ use teloxide::{
     types::{ChatId, Document, InlineKeyboardButton, InlineKeyboardMarkup, InputFile},
 };
 mod social;
+mod upload;
 
 // ---------- константы ----------
 
@@ -63,6 +64,7 @@ enum Flow {
     },
     AdminUpload {
         name: String,
+        upload: Option<upload::Parts>,
     },
 }
 
@@ -342,8 +344,8 @@ async fn on_message(
         Some(Flow::AdminRole { user_id }) => {
             admin_set_role_text(&bot, chat_id, &pool, user_id, &text).await?;
         }
-        Some(Flow::AdminUpload { name }) => {
-            flows.lock().unwrap().insert(chat_id, Flow::AdminUpload { name });
+        Some(Flow::AdminUpload { name, upload }) => {
+            flows.lock().unwrap().insert(chat_id, Flow::AdminUpload { name, upload });
             bot.send_message(chat_id, "Жду файл. Пришлите документ:")
                 .reply_markup(cancel_keyboard())
                 .await?;
@@ -1379,8 +1381,8 @@ async fn admin_callback(
                 "client_dll" => "client_dll",
                 _ => return Ok(()),
             };
-            flows.lock().unwrap().insert(chat_id, Flow::AdminUpload { name: name.to_string() });
-            bot.send_message(chat_id, format!("Пришлите файл ({name}) документом:"))
+            flows.lock().unwrap().insert(chat_id, Flow::AdminUpload { name: name.to_string(), upload:None });
+            bot.send_message(chat_id, format!("Пришлите DLL ({name}) документом до 20 МБ. Большие DLL отправляйте частями по порядку: файл.dll.sha256-<SHA256>.part1of2, затем part2of2. До получения всех частей прежняя версия сохраняется."))
                 .reply_markup(cancel_keyboard())
                 .await?;
         }
@@ -1791,7 +1793,7 @@ async fn on_document(
 ) -> ResponseResult<()> {
     let chat_id = msg.chat.id;
     let waiting: Option<String> = match flows.lock().unwrap().get(&chat_id) {
-        Some(Flow::AdminUpload { name }) => Some(name.clone()),
+        Some(Flow::AdminUpload { name, .. }) => Some(name.clone()),
         _ => None,
     };
     let bin_name = match waiting {
@@ -1804,7 +1806,7 @@ async fn on_document(
     }
     let size = doc.file.size;
     if size == 0 || size > 20 * 1024 * 1024 {
-        bot.send_message(chat_id, "Файл должен быть до 20 МБ. Пришлите другой:")
+        bot.send_message(chat_id, "Telegram Bot API скачивает файлы до 20 МБ. Разделите DLL на части до 20 МБ: файл.dll.sha256-<SHA256>.part1of2, затем part2of2. Отправляйте по порядку, без архива.")
             .reply_markup(cancel_keyboard())
             .await?;
         return Ok(());
@@ -1822,6 +1824,25 @@ async fn on_document(
         bot.send_message(chat_id, "Не скачался, попробуйте еще раз.").await?;
         return Ok(());
     }
+    let assembled = {
+        let mut active=flows.lock().unwrap();
+        match active.get_mut(&chat_id) {
+            Some(Flow::AdminUpload {name, upload}) if name==&bin_name =>
+                upload::accept(upload,doc.file_name.as_deref().unwrap_or("upload.dll"),buf),
+            _ => return Ok(()),
+        }
+    };
+    let buf=match assembled {
+        Ok(Some(data)) => data,
+        Ok(None) => {
+            bot.send_message(chat_id,"Часть принята. Пришлите следующую часть того же файла.").reply_markup(cancel_keyboard()).await?;
+            return Ok(());
+        }
+        Err(error) => {
+            bot.send_message(chat_id,error).reply_markup(cancel_keyboard()).await?;
+            return Ok(());
+        }
+    };
     let sha = hex::encode(Sha256::digest(&buf));
     let enc = encrypt_bytes(cipher, &buf);
     let row: Result<Option<(i32,)>, sqlx::Error> = sqlx::query_as(
