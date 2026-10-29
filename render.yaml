@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: telegrambot
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: TELOXIDE_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: ENCRYPTION_KEY
+        sync: false
+      - key: PAYLOAD_SIGNING_KEY_PEM
+        sync: false
+      - key: RUST_LOG
+        value: info
