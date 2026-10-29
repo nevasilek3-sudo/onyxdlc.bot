@@ -13,6 +13,21 @@ pub(super) struct Parts {
 // Chunks use <filename>.sha256-<full hash>.part1of2. Nothing is written to disk.
 pub(super) fn accept(state: &mut Option<Parts>, filename: &str, bytes: Vec<u8>) -> Result<Option<Vec<u8>>, &'static str> {
     if bytes.is_empty() || bytes.len() > 20 * 1024 * 1024 { return Err("Часть должна быть от 1 байта до 20 МБ."); }
+    if bytes.starts_with(b"ONYXUP1\n") {
+        let end=bytes[..bytes.len().min(128)].windows(2).position(|w| w==b"\n\n")
+            .ok_or("Повреждён заголовок части.")?;
+        let header=std::str::from_utf8(&bytes[..end]).map_err(|_| "Неверный заголовок части.")?;
+        let fields:Vec<_>=header.split('\n').collect();
+        if fields.len()!=3 { return Err("Неверный заголовок части."); }
+        let Some((part,total))=fields[2].split_once('/') else { return Err("Неверный номер части."); };
+        let canonical=format!("upload.dll.sha256-{}.part{}of{}",fields[1],part,total);
+        return accept_named(state,&canonical,bytes[end+2..].to_vec());
+    }
+    accept_named(state,filename,bytes)
+}
+
+fn accept_named(state: &mut Option<Parts>, filename: &str, bytes: Vec<u8>) -> Result<Option<Vec<u8>>, &'static str> {
+    if bytes.is_empty() { return Err("Пустая часть файла."); }
     let Some((base, suffix)) = filename.rsplit_once(".part") else {
         if state.is_some() { return Err("Сначала отправьте оставшиеся части или отмените загрузку."); }
         if !bytes.starts_with(b"MZ") { return Err("Нужен исходный DLL-файл, без ZIP или RAR."); }
@@ -62,5 +77,15 @@ mod tests {
         assert!(accept(&mut state,&format!("{base}.part2of2"),b"bb".to_vec()).is_err());
         assert!(state.is_none());
         assert!(accept(&mut state,"output.zip",b"PKzip".to_vec()).is_err());
+    }
+    #[test] fn embedded_metadata_survives_renaming() {
+        let data=b"MZ-test-payload";
+        let hash=hex::encode(Sha256::digest(data));
+        let mut state=None;
+        let mut first=format!("ONYXUP1\n{hash}\n1/2\n\n").into_bytes();first.extend(&data[..4]);
+        let mut second=format!("ONYXUP1\n{hash}\n2/2\n\n").into_bytes();second.extend(&data[4..]);
+        assert!(accept(&mut state,"renamed-by-telegram.bin",first).unwrap().is_none());
+        assert_eq!(accept(&mut state,"different-name.bin",second).unwrap().unwrap(),data);
+        assert!(accept(&mut state,"bad.part1",b"ONYXUP1\nbad".to_vec()).is_err());
     }
 }

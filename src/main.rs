@@ -1382,7 +1382,7 @@ async fn admin_callback(
                 _ => return Ok(()),
             };
             flows.lock().unwrap().insert(chat_id, Flow::AdminUpload { name: name.to_string(), upload:None });
-            bot.send_message(chat_id, format!("Пришлите DLL ({name}) документом до 20 МБ. Большие DLL отправляйте частями по порядку: файл.dll.sha256-<SHA256>.part1of2, затем part2of2. До получения всех частей прежняя версия сохраняется."))
+            bot.send_message(chat_id, format!("Пришлите DLL ({name}) документом до 20 МБ. Большие DLL подготовьте скриптом make_upload_parts.ps1 и отправляйте из upload-ready по порядку: output.part1of2, затем output.part2of2. До получения всех частей прежняя версия сохраняется."))
                 .reply_markup(cancel_keyboard())
                 .await?;
         }
@@ -1806,7 +1806,7 @@ async fn on_document(
     }
     let size = doc.file.size;
     if size == 0 || size > 20 * 1024 * 1024 {
-        bot.send_message(chat_id, "Telegram Bot API скачивает файлы до 20 МБ. Разделите DLL на части до 20 МБ: файл.dll.sha256-<SHA256>.part1of2, затем part2of2. Отправляйте по порядку, без архива.")
+        bot.send_message(chat_id, "Telegram Bot API скачивает файлы до 20 МБ. Подготовьте части скриптом make_upload_parts.ps1 и отправьте файлы из upload-ready по порядку, без архива.")
             .reply_markup(cancel_keyboard())
             .await?;
         return Ok(());
