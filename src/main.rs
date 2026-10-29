@@ -20,6 +20,7 @@ use teloxide::{
     prelude::*,
     types::{ChatId, Document, InlineKeyboardButton, InlineKeyboardMarkup, InputFile},
 };
+mod social;
 
 // ---------- константы ----------
 
@@ -73,6 +74,7 @@ struct Profile {
     sub_expires_at: Option<DateTime<Utc>>,
     role: String,
     hwid_enc: Option<String>,
+    loader_locked: bool,
 }
 
 // У админов отображаемый UID всегда 0.
@@ -155,6 +157,7 @@ async fn main() {
         pool: pool.clone(),
         cipher: cipher.clone(),
         login_fails: Arc::new(Mutex::new(HashMap::new())),
+        social: Arc::new(Mutex::new(social::Relay::default())),
     };
     tokio::spawn(run_health_server(port, state));
 
@@ -180,7 +183,9 @@ async fn run_health_server(port: u16, state: ApiState) {
         .route("/health", get(|| async { "ok" }))
         .route("/api/auth/login", post(api_login))
         .route("/api/auth/heartbeat", post(api_heartbeat))
+        .route("/api/auth/launch", post(api_launch))
         .route("/api/profile", post(api_profile))
+        .route("/api/social/sync", post(social::sync))
         .route("/api/dll", get(api_dll))
         .route("/api/dll/info", get(api_dll_info))
         .route("/api/cloud/list", post(api_cloud_list))
@@ -198,6 +203,7 @@ async fn run_health_server(port: u16, state: ApiState) {
         .route("/loader/app.js", get(loader_js))
         .route("/loader/fonts/sf-regular.ttf", get(loader_font_regular))
         .route("/loader/fonts/sf-bold.ttf", get(loader_font_bold))
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{port}");
@@ -252,6 +258,7 @@ async fn on_message(
     cipher: Cipher,
 ) -> ResponseResult<()> {
     let chat_id = msg.chat.id;
+    if !msg.chat.is_private() { return Ok(()); }
     let text = msg.text().map(|t| t.trim().to_string()).unwrap_or_default();
 
     if text == "/cancel" {
@@ -274,6 +281,10 @@ async fn on_message(
     }
 
     let flow = flows.lock().unwrap().remove(&chat_id);
+    if matches!(&flow, Some(Flow::AdminFind | Flow::AdminDelKey | Flow::AdminGrant { .. }
+        | Flow::AdminNewKey { .. } | Flow::AdminNewCustom { .. } | Flow::AdminGrantCustom { .. }
+        | Flow::AdminRole { .. } | Flow::AdminUpload { .. }))
+        && require_admin(&bot, chat_id, &pool, tg_of(&msg)).await?.is_none() { return Ok(()); }
     match flow {
         None => {
             bot.send_message(chat_id, "Нажмите /start, чтобы начать.").await?;
@@ -382,6 +393,7 @@ async fn on_callback(
         None => ChatId(q.from.id.0 as i64),
     };
     let tg_id = q.from.id.0 as i64;
+    if chat_id.0 != tg_id { return Ok(()); }
 
     // Админские колбэки — отдельным обработчиком.
     let data = q.data.as_deref().unwrap_or("").to_string();
@@ -399,6 +411,26 @@ async fn on_callback(
     }
 
     match q.data.as_deref() {
+        Some("loader_lock") | Some("loader_unlock") => {
+            if chat_id.0 != tg_id { return Ok(()); }
+            if let Ok(Some(profile)) = profile_by_tg(&pool, tg_id).await {
+                if !plan_active(&profile.sub_plan, profile.sub_expires_at) {
+                    bot.send_message(chat_id, "Нужна активная подписка.").await?;
+                    return Ok(());
+                }
+                let locked = q.data.as_deref() == Some("loader_lock");
+                match sqlx::query("UPDATE users SET loader_locked = $1 WHERE id = $2 AND telegram_id = $3")
+                    .bind(locked).bind(profile.id).bind(tg_id).execute(&pool).await {
+                    Ok(_) => {
+                        bot.send_message(chat_id, if locked {
+                            "Лоадер заблокирован. Новый инжект запрещён. Запущенный Minecraft продолжит работать."
+                        } else { "Лоадер разблокирован. Инжект снова доступен." }).await?;
+                        show_cabinet(&bot, chat_id, tg_id, &pool, &cipher).await?;
+                    }
+                    Err(_) => { bot.send_message(chat_id, "Не удалось изменить блокировку. Попробуйте позже.").await?; }
+                }
+            }
+        }
         Some("cancel") => {
             flows.lock().unwrap().remove(&chat_id);
             bot.send_message(chat_id, "Отменено. /start — в начало.").await?;
@@ -607,6 +639,7 @@ async fn reg_email(
                 sub_expires_at: None,
                 role: "user".to_string(),
                 hwid_enc: None,
+                loader_locked: false,
             };
             bot.send_message(chat_id, format!("Готово! Аккаунт создан ✅\nВаш UID: {id}"))
                 .await?;
@@ -706,6 +739,8 @@ async fn login_password(
         sub_expires_at: sub_exp,
         role,
         hwid_enc,
+        loader_locked: sqlx::query_scalar("SELECT loader_locked FROM users WHERE id = $1")
+            .bind(id).fetch_one(pool).await.unwrap_or(true),
     };
     let hwid = p.hwid_enc.as_deref().and_then(|h| decrypt(cipher, h));
     send_cabinet(bot, chat_id, &p, hwid).await?;
@@ -730,12 +765,18 @@ async fn send_cabinet(
         p.telegram_id,
         hwid.unwrap_or_else(|| "Не привязан".to_string()),
     );
-    let kb = cabinet_keyboard(p.role == "admin");
+    let mut kb = cabinet_keyboard(p.role == "admin");
+    if plan_active(&p.sub_plan, p.sub_expires_at) {
+        kb.inline_keyboard.push(vec![InlineKeyboardButton::callback(
+            if p.loader_locked { "🔓 Разблокировать лоадер" } else { "🔒 Заблокировать лоадер" },
+            if p.loader_locked { "loader_unlock" } else { "loader_lock" },
+        )]);
+    }
     if Path::new(PROFILE_PHOTO_PATH).exists() {
         if bot
             .send_photo(chat_id, InputFile::file(PROFILE_PHOTO_PATH))
             .caption(&text)
-            .reply_markup(kb)
+            .reply_markup(kb.clone())
             .await
             .is_ok()
         {
@@ -746,7 +787,7 @@ async fn send_cabinet(
     }
     // Запасной вариант без фото.
     bot.send_message(chat_id, text)
-        .reply_markup(cabinet_keyboard(p.role == "admin"))
+        .reply_markup(kb)
         .await?;
     Ok(())
 }
@@ -793,9 +834,10 @@ async fn send_auth_photo(bot: &Bot, chat_id: ChatId, caption: &str) -> ResponseR
 fn format_sub(plan: &str, expires_at: Option<DateTime<Utc>>) -> String {
     match plan {
         "forever" => "навсегда".to_string(),
-        "d30" | "d120" | "d240" | "d360" => {
+        "d30" | "d180" | "d120" | "d240" | "d360" => {
             let days_total = match plan {
                 "d30" => 30,
+                "d180" => 180,
                 "d120" => 120,
                 "d240" => 240,
                 _ => 360,
@@ -843,6 +885,8 @@ async fn profile_by_tg(pool: &PgPool, tg_id: i64) -> Result<Option<Profile>, sql
             sub_expires_at,
             role: role.unwrap_or_else(|| "user".to_string()),
             hwid_enc,
+            loader_locked: sqlx::query_scalar("SELECT loader_locked FROM users WHERE id = $1")
+                .bind(id).fetch_one(pool).await.unwrap_or(true),
         });
     }
     Ok(out)
@@ -961,6 +1005,7 @@ const MANAGER_USERNAME: &str = "NeVasilek";
 fn tariff_name(kind: &str) -> &'static str {
     match kind {
         "d30" => "30 дней",
+        "d180" => "180 дней",
         "d120" => "120 дней",
         "d240" => "240 дней",
         "d360" => "360 дней",
@@ -973,12 +1018,10 @@ fn tariff_name(kind: &str) -> &'static str {
 
 fn tariff_price(kind: &str) -> i32 {
     match kind {
-        "d30" => 99,
-        "d120" => 249,
-        "d240" => 399,
-        "d360" => 549,
-        "forever" => 999,
-        "hwid" => 50,
+        "d30" => 300,
+        "d180" => 500,
+        "forever" => 800,
+        "hwid" => 100,
         _ => 0,
     }
 }
@@ -986,6 +1029,7 @@ fn tariff_price(kind: &str) -> i32 {
 fn tariff_days(kind: &str) -> Option<i64> {
     match kind {
         "d30" => Some(30),
+        "d180" => Some(180),
         "d120" => Some(120),
         "d240" => Some(240),
         "d360" => Some(360),
@@ -1021,9 +1065,9 @@ async fn show_shop(bot: &Bot, chat_id: ChatId, pool: &PgPool) -> ResponseResult<
         Ok(Some(p)) => (shown_uid(p.id, &p.role).to_string(), p.username),
         _ => ("—".to_string(), "—".to_string()),
     };
-    let caption = "🛒 Магазин\n\nПодписки:\n├ 30 дней — 99₽\n├ 120 дней — 249₽\n├ 240 дней — 399₽\n├ 360 дней — 549₽\n└ Навсегда — 999₽\n\nСброс HWID — 50₽\n\nНажмите тариф — откроется чат с менеджером и готовым текстом заказа.";
+    let caption = "🛒 Магазин\n\nПодписки:\n├ 30 дней — 300₽\n├ 180 дней — 500₽\n└ Навсегда — 800₽\n\nСброс HWID — 100₽\n\nНажмите тариф — откроется чат с менеджером и готовым текстом заказа.";
     let mut kb: Vec<Vec<InlineKeyboardButton>> = Vec::new();
-    for kind in ["d30", "d120", "d240", "d360", "forever", "hwid"] {
+    for kind in ["d30", "d180", "forever", "hwid"] {
         let label = format!("{} — {}₽", tariff_name(kind), tariff_price(kind));
         let order = format!(
             "Здравствуйте! Хочу оформить: {} ({}₽). Мой UID: {}, логин: {}, Telegram ID: {}.",
@@ -1272,8 +1316,8 @@ async fn show_admin(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
 fn kind_buttons(prefix: &str) -> InlineKeyboardMarkup {
     let b = |t: &str, k: &str| InlineKeyboardButton::callback(t, format!("{prefix}{k}"));
     InlineKeyboardMarkup::new([
-        vec![b("30 дней", "d30"), b("120 дней", "d120"), b("240 дней", "d240")],
-        vec![b("360 дней", "d360"), b("Навсегда", "forever"), b("Сброс HWID", "hwid")],
+        vec![b("30 дней", "d30"), b("180 дней", "d180")],
+        vec![b("Навсегда", "forever"), b("Сброс HWID", "hwid")],
         vec![b("Кастом ⏳", "custom")],
         vec![InlineKeyboardButton::callback("Отмена ✕", "cancel")],
     ])
@@ -2005,6 +2049,7 @@ struct ApiState {
     pool: PgPool,
     cipher: Cipher,
     login_fails: Arc<Mutex<HashMap<String, (u32, DateTime<Utc>)>>>,
+    social: Arc<Mutex<social::Relay>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -2049,6 +2094,14 @@ struct DllQuery {
     hwid: String,
 }
 
+fn dll_auth(headers: &axum::http::HeaderMap) -> DllQuery {
+    DllQuery {
+        token: headers.get("authorization").and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("").to_owned(),
+        hwid: headers.get("x-onyx-hwid").and_then(|v| v.to_str().ok()).unwrap_or("").to_owned(),
+    }
+}
+
 fn login_fail_resp(msg: &str) -> (axum::http::StatusCode, axum::Json<LoginResp>) {
     (
         axum::http::StatusCode::UNAUTHORIZED,
@@ -2078,10 +2131,9 @@ fn plan_active(plan: &str, exp: Option<DateTime<Utc>>) -> bool {
 /// true = заблокировать (много неудач за 10 минут).
 fn throttle_check(state: &ApiState, key: &str) -> bool {
     let mut m = state.login_fails.lock().unwrap();
-    if m.len() > 2000 {
-        m.clear();
-    }
     let now = Utc::now();
+    m.retain(|_, entry| (now - entry.1).num_minutes() < 10);
+    if m.len() >= 2000 && !m.contains_key(key) { return true; }
     let e = m.entry(key.to_string()).or_insert((0, now));
     if (now - e.1).num_minutes() >= 10 {
         *e = (0, now);
@@ -2092,7 +2144,7 @@ fn throttle_check(state: &ApiState, key: &str) -> bool {
 fn throttle_hit(state: &ApiState, key: &str) {
     let mut m = state.login_fails.lock().unwrap();
     let e = m.entry(key.to_string()).or_insert((0, Utc::now()));
-    e.0 += 1;
+    e.0 = e.0.saturating_add(1);
     e.1 = Utc::now();
 }
 
@@ -2106,13 +2158,17 @@ fn gen_session_token() -> (String, String) {
 }
 
 async fn check_session(pool: &PgPool, token: &str, hwid: &str) -> Option<i64> {
+    if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) || hwid.is_empty() || hwid.len() > 256 { return None; }
     let h = sha_hex(token.trim());
     let row: Option<(i64, Option<String>, DateTime<Utc>)> =
         sqlx::query_as::<_, (i64, Option<String>, DateTime<Utc>)>(
             "SELECT s.user_id, u.hwid_hash, s.expires_at FROM sessions s
-         JOIN users u ON u.id = s.user_id WHERE s.token_hash = $1",
+         JOIN users u ON u.id = s.user_id WHERE s.token_hash = $1
+         AND s.hwid_hash = $2 AND u.hwid_hash = $2
+         AND (u.sub_plan = 'forever' OR (u.sub_plan <> 'none' AND u.sub_expires_at > now()))",
         )
         .bind(&h)
+        .bind(sha_hex(hwid.trim()))
         .fetch_optional(pool)
         .await
         .unwrap_or(None);
@@ -2134,7 +2190,7 @@ async fn api_login(
 ) -> impl axum::response::IntoResponse {
     use axum::http::StatusCode;
     let ident = req.ident.trim().to_string();
-    if ident.is_empty() || req.password.is_empty() || req.hwid.trim().is_empty() {
+    if ident.is_empty() || ident.len() > 254 || req.password.is_empty() || req.password.len() > 1024 || req.hwid.trim().is_empty() || req.hwid.len() > 256 {
         return login_fail_resp("bad request");
     }
     let key = ident.to_lowercase();
@@ -2193,15 +2249,17 @@ async fn api_login(
     match cur {
         None => {
             let enc = encrypt(&s.cipher, req.hwid.trim());
-            if sqlx::query("UPDATE users SET hwid_hash = $1, hwid_enc = $2 WHERE id = $3")
+            let binding = sqlx::query("UPDATE users SET hwid_hash = $1, hwid_enc = $2 WHERE id = $3 AND (hwid_hash IS NULL OR hwid_hash = $1)")
                 .bind(&hw)
                 .bind(&enc)
                 .bind(id)
                 .execute(&s.pool)
-                .await
-                .is_err()
-            {
+                .await;
+            if binding.is_err() {
                 return login_fail_resp("temporary error");
+            }
+            if binding.unwrap().rows_affected() != 1 {
+                return login_fail_resp("hwid_mismatch");
             }
         }
         Some(stored) if stored != hw => {
@@ -2326,10 +2384,31 @@ async fn api_profile(
     api_heartbeat(axum::extract::State(s), axum::Json(req)).await
 }
 
+async fn loader_allowed(pool: &PgPool, uid: i64) -> bool {
+    sqlx::query_scalar::<_, bool>("SELECT NOT loader_locked FROM users WHERE id = $1")
+        .bind(uid).fetch_optional(pool).await.ok().flatten().unwrap_or(false)
+}
+
+async fn api_launch(
+    axum::extract::State(s): axum::extract::State<ApiState>,
+    axum::Json(req): axum::Json<TokenReq>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let uid = check_session(&s.pool, &req.token, &req.hwid).await;
+    if let Some(uid) = uid {
+        if loader_allowed(&s.pool, uid).await {
+            return api_profile(axum::extract::State(s), axum::Json(req)).await.into_response();
+        }
+        return (axum::http::StatusCode::FORBIDDEN, axum::Json(serde_json::json!({"ok":false,"error":"loader_locked"}))).into_response();
+    }
+    (axum::http::StatusCode::UNAUTHORIZED, axum::Json(serde_json::json!({"ok":false,"error":"invalid session"}))).into_response()
+}
+
 async fn api_dll(
     axum::extract::State(s): axum::extract::State<ApiState>,
-    axum::extract::Query(q): axum::extract::Query<DllQuery>,
+    headers: axum::http::HeaderMap,
 ) -> impl axum::response::IntoResponse {
+    let q = dll_auth(&headers);
     use axum::http::{header::CONTENT_TYPE, StatusCode};
     let uid = match check_session(&s.pool, &q.token, &q.hwid).await {
         Some(u) => u,
@@ -2341,7 +2420,9 @@ async fn api_dll(
             );
         }
     };
-    let _ = uid;
+    if !loader_allowed(&s.pool, uid).await {
+        return (StatusCode::FORBIDDEN, [(CONTENT_TYPE, "text/plain")], Vec::new());
+    }
     let row: Option<(Vec<u8>,)> =
         sqlx::query_as::<_, (Vec<u8>,)>("SELECT data FROM binaries WHERE name = 'client_dll'")
             .fetch_optional(&s.pool)
@@ -2358,6 +2439,16 @@ struct DllInfoResp {
     ok: bool,
     sha256: Option<String>,
     version: Option<i32>,
+    signature: Option<String>,
+}
+
+fn sign_manifest(hash: &str, version: i32) -> Option<String> {
+    use rsa::{pkcs8::DecodePrivateKey, signature::{Signer, SignatureEncoding}};
+    let pem = std::env::var("PAYLOAD_SIGNING_KEY_PEM").ok()?;
+    let key = rsa::RsaPrivateKey::from_pkcs8_pem(&pem).ok()?;
+    let signer = rsa::pkcs1v15::SigningKey::<Sha256>::new(key);
+    let signature = signer.sign(format!("onyx-client-dll:{version}:{hash}").as_bytes());
+    Some(hex::encode(signature.to_bytes()))
 }
 
 // ---------- облако: конфиги и темы ----------
@@ -2822,13 +2913,15 @@ async fn api_friends_remove(
 
 async fn api_dll_info(
     axum::extract::State(s): axum::extract::State<ApiState>,
-    axum::extract::Query(q): axum::extract::Query<DllQuery>,
+    headers: axum::http::HeaderMap,
 ) -> impl axum::response::IntoResponse {
+    let q = dll_auth(&headers);
     use axum::http::StatusCode;
-    if check_session(&s.pool, &q.token, &q.hwid).await.is_none() {
+    let uid = check_session(&s.pool, &q.token, &q.hwid).await;
+    if uid.is_none() || !loader_allowed(&s.pool, uid.unwrap_or(0)).await {
         return (
             StatusCode::UNAUTHORIZED,
-            axum::Json(DllInfoResp { ok: false, sha256: None, version: None }),
+            axum::Json(DllInfoResp { ok: false, sha256: None, version: None, signature: None }),
         );
     }
     let row: Option<(String, i32)> =
@@ -2837,13 +2930,17 @@ async fn api_dll_info(
             .await
             .unwrap_or(None);
     match row {
-        Some((sha, v)) => (
-            StatusCode::OK,
-            axum::Json(DllInfoResp { ok: true, sha256: Some(sha), version: Some(v) }),
-        ),
+        Some((sha, v)) => {
+            let signing_hash = sha.clone();
+            let signature = tokio::task::spawn_blocking(move || sign_manifest(&signing_hash,v)).await.ok().flatten();
+            if signature.is_none() {
+                return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(DllInfoResp { ok:false, sha256:None, version:None, signature:None }));
+            }
+            (StatusCode::OK, axum::Json(DllInfoResp { ok: true, sha256: Some(sha), version: Some(v), signature }))
+        },
         None => (
             StatusCode::NOT_FOUND,
-            axum::Json(DllInfoResp { ok: false, sha256: None, version: None }),
+            axum::Json(DllInfoResp { ok: false, sha256: None, version: None, signature: None }),
         ),
     }
 }

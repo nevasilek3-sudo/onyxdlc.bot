@@ -1,12 +1,12 @@
 # Build
 FROM rust:slim AS builder
 WORKDIR /app
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY assets ./assets
 COPY migrations ./migrations
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/* \
-    && cargo build --release
+    && cargo build --release --locked
 
 # Run
 FROM debian:trixie-slim

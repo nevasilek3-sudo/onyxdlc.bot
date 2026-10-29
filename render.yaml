@@ -11,5 +11,7 @@ services:
         sync: false
       - key: ENCRYPTION_KEY
         sync: false
+      - key: PAYLOAD_SIGNING_KEY_PEM
+        sync: false
       - key: RUST_LOG
         value: info
